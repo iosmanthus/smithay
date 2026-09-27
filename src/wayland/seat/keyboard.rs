@@ -212,6 +212,29 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
     serial: Serial,
 ) {
     *seat.get_keyboard().unwrap().arc.last_enter.lock().unwrap() = Some(serial);
+
+    let text_input = seat.text_input();
+    let input_method = seat.input_method();
+
+    if input_method.has_instance() {
+        input_method.deactivate_input_method(state);
+    }
+
+    // Text-input focus goes first. Clients such as Chromium react to `wl_keyboard.enter` by
+    // reporting the caret rectangle right away, and drop it when the surface does not have
+    // text-input focus yet; they only report it again once the caret moves, which leaves the
+    // input method popup without a position until the user starts typing.
+    //
+    // NOTE: Always set focus regardless whether the client actually has the
+    // text-input global bound due to clients doing lazy global binding.
+    text_input.set_focus(Some(surface.clone()));
+
+    // Notify on `enter` once we have an actual IME, or while the compositor is itself acting
+    // as the input method for this seat.
+    if input_method.has_instance() || text_input.compositor_input_method() {
+        text_input.enter();
+    }
+
     let serialized_keys = serialize_pressed_keys(keys);
     for_each_focused_kbds(seat, surface, |kbd| {
         kbd.enter(serial.into(), surface, serialized_keys.clone())
@@ -240,23 +263,6 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
             .insert(seat, hook_id)
     }) {
         remove_destruction_hook(surface, &old_hook_id);
-    }
-
-    let text_input = seat.text_input();
-    let input_method = seat.input_method();
-
-    if input_method.has_instance() {
-        input_method.deactivate_input_method(state);
-    }
-
-    // NOTE: Always set focus regardless whether the client actually has the
-    // text-input global bound due to clients doing lazy global binding.
-    text_input.set_focus(Some(surface.clone()));
-
-    // Notify on `enter` once we have an actual IME, or while the compositor is itself acting
-    // as the input method for this seat.
-    if input_method.has_instance() || text_input.compositor_input_method() {
-        text_input.enter();
     }
 }
 
