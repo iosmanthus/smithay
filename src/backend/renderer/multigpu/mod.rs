@@ -857,7 +857,27 @@ impl<'render, 'target, R: GraphicsApi, T: GraphicsApi> MultiRenderer<'render, 't
 }
 
 /// A Framebuffer of a [`MultiRenderer`].
-pub struct MultiFramebuffer<'buffer, T: GraphicsApi>(MultiFramebufferInternal<'buffer, T>);
+pub struct MultiFramebuffer<'buffer, T: GraphicsApi>(MultiFramebufferInternal<'buffer, T>, DirectTarget);
+
+/// The bound target buffer itself, when the render gpu might copy into it directly (see
+/// [`SharedBuffer::VulkanDirect`]).
+#[cfg(feature = "renderer_multi_vulkan")]
+type DirectTarget = Option<Dmabuf>;
+#[cfg(feature = "renderer_multi_vulkan")]
+use crate::backend::allocator::dmabuf::WeakDmabuf;
+#[cfg(not(feature = "renderer_multi_vulkan"))]
+type DirectTarget = ();
+
+/// Only a `LINEAR` dmabuf qualifies: that is the one layout another vendor's driver can write.
+#[cfg(feature = "renderer_multi_vulkan")]
+fn direct_target<B: 'static>(bind: &B) -> DirectTarget {
+    (bind as &dyn Any)
+        .downcast_ref::<Dmabuf>()
+        .filter(|dmabuf| BufferTrait::format(*dmabuf).modifier == Modifier::Linear)
+        .cloned()
+}
+#[cfg(not(feature = "renderer_multi_vulkan"))]
+fn direct_target<B: 'static>(_bind: &B) -> DirectTarget {}
 enum MultiFramebufferInternal<'buffer, T: GraphicsApi> {
     Render(<<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>),
     Target(<<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>),
@@ -1001,6 +1021,14 @@ enum SharedBuffer {
         target: Dmabuf,
         job: Arc<vulkan_copy::CopyJob>,
     },
+    /// Rendered on the render gpu into `render`, then copied by the render gpu's Vulkan driver straight into
+    /// the target's own `LINEAR` buffers, which the target gpu then only scans out -- the arrangement PRIME
+    /// uses. One copy job per target buffer; `None` marks one the render gpu cannot import.
+    #[cfg(feature = "renderer_multi_vulkan")]
+    VulkanDirect {
+        render: Dmabuf,
+        jobs: Vec<(WeakDmabuf, Option<Arc<vulkan_copy::CopyJob>>)>,
+    },
 }
 
 impl SharedBuffer {
@@ -1008,7 +1036,7 @@ impl SharedBuffer {
         match self {
             SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
             #[cfg(feature = "renderer_multi_vulkan")]
-            SharedBuffer::VulkanCopy { render, .. } => render,
+            SharedBuffer::VulkanCopy { render, .. } | SharedBuffer::VulkanDirect { render, .. } => render,
         }
     }
 
@@ -1016,8 +1044,15 @@ impl SharedBuffer {
         match self {
             SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
             #[cfg(feature = "renderer_multi_vulkan")]
-            SharedBuffer::VulkanCopy { render, .. } => render,
+            SharedBuffer::VulkanCopy { render, .. } | SharedBuffer::VulkanDirect { render, .. } => render,
         }
+    }
+
+    fn is_direct(&self) -> bool {
+        #[cfg(feature = "renderer_multi_vulkan")]
+        return matches!(self, SharedBuffer::VulkanDirect { .. });
+        #[cfg(not(feature = "renderer_multi_vulkan"))]
+        return false;
     }
 
     /// The buffer the target gpu samples from, if it can import one.
@@ -1027,25 +1062,58 @@ impl SharedBuffer {
             SharedBuffer::CpuCopy(_) => None,
             #[cfg(feature = "renderer_multi_vulkan")]
             SharedBuffer::VulkanCopy { target, .. } => Some(target),
+            #[cfg(feature = "renderer_multi_vulkan")]
+            SharedBuffer::VulkanDirect { .. } => None,
         }
     }
 
     fn vulkan_job(&self) -> PendingVulkanJob {
         #[cfg(feature = "renderer_multi_vulkan")]
         return match self {
-            SharedBuffer::VulkanCopy { job, .. } => Some(job.clone()),
+            SharedBuffer::VulkanCopy { job, .. } => Some(VulkanJob {
+                job: job.clone(),
+                direct: false,
+            }),
             _ => None,
         };
         #[cfg(not(feature = "renderer_multi_vulkan"))]
         return ();
     }
+
+    /// The copy from this buffer into the target's buffer `dst`, set up on first use. `None` if the render gpu
+    /// cannot import `dst`.
+    #[cfg(feature = "renderer_multi_vulkan")]
+    fn direct_job(
+        &mut self,
+        dst: &Dmabuf,
+        copier: &vulkan_copy::VulkanCopier,
+    ) -> Option<Arc<vulkan_copy::CopyJob>> {
+        let SharedBuffer::VulkanDirect { render, jobs } = self else {
+            return None;
+        };
+        // Target buffers come and go with the swapchains of the outputs sharing this buffer.
+        jobs.retain(|(buffer, _)| buffer.upgrade().is_some());
+        let weak = dst.weak();
+        if let Some((_, job)) = jobs.iter().find(|(buffer, _)| *buffer == weak) {
+            return job.clone();
+        }
+        let job = match copier.prepare(render, dst) {
+            Ok(job) => Some(Arc::new(job)),
+            Err(err) => {
+                warn!("Cannot copy into the target buffer directly: {}", err);
+                None
+            }
+        };
+        jobs.push((weak, job.clone()));
+        job
+    }
 }
 
 impl SharedBuffers {
-    fn position(&self, size: Size<i32, BufferCoords>, format: Fourcc) -> Option<usize> {
-        self.0
-            .iter()
-            .position(|(code, buffer)| *code == format && buffer.render_buffer().size() == size)
+    fn position(&self, size: Size<i32, BufferCoords>, format: Fourcc, direct: bool) -> Option<usize> {
+        self.0.iter().position(|(code, buffer)| {
+            *code == format && buffer.is_direct() == direct && buffer.render_buffer().size() == size
+        })
     }
 
     fn push(&mut self, format: Fourcc, buffer: SharedBuffer) -> usize {
@@ -1067,14 +1135,27 @@ impl SharedBuffers {
     /// Forget buffers whose Vulkan device was lost, so they are set up again on a new one.
     fn drop_lost(&mut self) {
         #[cfg(feature = "renderer_multi_vulkan")]
-        self.0
-            .retain(|(_, buffer)| !matches!(buffer, SharedBuffer::VulkanCopy { job, .. } if job.is_lost()));
+        self.0.retain(|(_, buffer)| match buffer {
+            SharedBuffer::VulkanCopy { job, .. } => !job.is_lost(),
+            SharedBuffer::VulkanDirect { jobs, .. } => !jobs
+                .iter()
+                .any(|(_, job)| job.as_ref().is_some_and(|job| job.is_lost())),
+            _ => true,
+        });
     }
 }
 
 /// A Vulkan copy to run once rendering finishes.
 #[cfg(feature = "renderer_multi_vulkan")]
-type PendingVulkanJob = Option<Arc<vulkan_copy::CopyJob>>;
+#[derive(Debug)]
+struct VulkanJob {
+    job: Arc<vulkan_copy::CopyJob>,
+    /// The copy writes the target's own buffer (see [`SharedBuffer::VulkanDirect`]), which leaves the target
+    /// gpu nothing to do.
+    direct: bool,
+}
+#[cfg(feature = "renderer_multi_vulkan")]
+type PendingVulkanJob = Option<VulkanJob>;
 #[cfg(not(feature = "renderer_multi_vulkan"))]
 type PendingVulkanJob = ();
 
@@ -1256,7 +1337,7 @@ where
     }
 }
 
-impl<R: GraphicsApi, T: GraphicsApi, Target> Offscreen<Target> for MultiRenderer<'_, '_, R, T>
+impl<R: GraphicsApi, T: GraphicsApi, Target: 'static> Offscreen<Target> for MultiRenderer<'_, '_, R, T>
 where
     <T::Device as ApiDevice>::Renderer: Offscreen<Target>,
     // We need these because the Bind-impl does and Offscreen requires Bind
@@ -1297,7 +1378,7 @@ where
     }
 }
 
-impl<R: GraphicsApi, T: GraphicsApi, Target> Bind<Target> for MultiRenderer<'_, '_, R, T>
+impl<R: GraphicsApi, T: GraphicsApi, Target: 'static> Bind<Target> for MultiRenderer<'_, '_, R, T>
 where
     <T::Device as ApiDevice>::Renderer: Bind<Target>,
     // We need this because the Renderer-impl does and Bind requires Unbind, which requires Renderer
@@ -1317,12 +1398,12 @@ where
         bind: &'a mut Target,
     ) -> Result<<Self as RendererSuper>::Framebuffer<'a>, <Self as RendererSuper>::Error> {
         if let Some(target) = self.target.as_mut() {
+            let direct = direct_target(&*bind);
             target
                 .device
                 .renderer_mut()
                 .bind(bind)
-                .map(MultiFramebufferInternal::Target)
-                .map(MultiFramebuffer)
+                .map(|framebuffer| MultiFramebuffer(MultiFramebufferInternal::Target(framebuffer), direct))
                 .map_err(Error::Target)
         } else {
             // SAFETY: We know this is safe, because `self.target` can only be `None` if R == T.
@@ -1334,8 +1415,9 @@ where
             };
             renderer
                 .bind(bind)
-                .map(MultiFramebufferInternal::Render)
-                .map(MultiFramebuffer)
+                .map(|framebuffer| {
+                    MultiFramebuffer(MultiFramebufferInternal::Render(framebuffer), Default::default())
+                })
                 .map_err(Error::Target)
         }
     }
@@ -1424,58 +1506,113 @@ where
     where
         'buffer: 'frame,
     {
+        #[cfg(feature = "renderer_multi_vulkan")]
+        let direct_dst = framebuffer.1.clone();
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
             target.cached_buffer.drop_lost();
-            let index = match target.cached_buffer.position(buffer_size, target.format) {
-                Some(index) => index,
-                None => {
-                    let buffer = match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target)
-                    {
-                        Ok(dmabuf) => SharedBuffer::Direct(dmabuf),
-                        Err(err) => {
-                            warn!(
-                                "Error importing dmabuf from {} to {}: {}",
-                                *self.render.node(),
-                                *target.device.node(),
-                                err
-                            );
-                            let dmabuf = allocate_render_buffer::<R, T>(
-                                self.render,
-                                target.format,
-                                size,
-                                dst_transform,
-                            )?;
 
-                            #[cfg(feature = "renderer_multi_vulkan")]
-                            let buffer = {
-                                let render_node = *self.render.node();
-                                match vulkan_copy_buffer::<T>(&render_node, dmabuf, target) {
-                                    Ok(buffer) => {
-                                        info!(
-                                            "Copying from {} to {} through Vulkan.",
-                                            render_node,
-                                            *target.device.node()
-                                        );
-                                        buffer
-                                    }
-                                    Err((dmabuf, err)) => {
-                                        info!("Vulkan copies unavailable: {}", err);
-                                        info!("Falling back to cpu-copy.");
-                                        SharedBuffer::CpuCopy(dmabuf)
-                                    }
+            // Copy straight into the bound buffer when the render gpu can write it.
+            #[cfg(feature = "renderer_multi_vulkan")]
+            let direct = match direct_dst {
+                Some(dst) if dst.size() == buffer_size && BufferTrait::format(&dst).code == target.format => {
+                    let render_node = *self.render.node();
+                    match vulkan_copier(&render_node, target.vulkan_copiers) {
+                        Some(copier) => {
+                            let index = match target.cached_buffer.position(buffer_size, target.format, true)
+                            {
+                                Some(index) => index,
+                                None => {
+                                    let render = allocate_render_buffer::<R, T>(
+                                        self.render,
+                                        target.format,
+                                        size,
+                                        dst_transform,
+                                    )?;
+                                    info!(
+                                        "Copying from {} straight into buffers of {} through Vulkan.",
+                                        render_node,
+                                        *target.device.node()
+                                    );
+                                    target.cached_buffer.push(
+                                        target.format,
+                                        SharedBuffer::VulkanDirect {
+                                            render,
+                                            jobs: Vec::new(),
+                                        },
+                                    )
                                 }
                             };
-                            #[cfg(not(feature = "renderer_multi_vulkan"))]
-                            let buffer = {
-                                info!("Falling back to cpu-copy.");
-                                SharedBuffer::CpuCopy(dmabuf)
-                            };
-                            buffer
+                            target
+                                .cached_buffer
+                                .get_mut(index)
+                                .direct_job(&dst, &copier)
+                                .map(|job| (index, Some(VulkanJob { job, direct: true })))
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            #[cfg(not(feature = "renderer_multi_vulkan"))]
+            let direct: Option<(usize, PendingVulkanJob)> = None;
+
+            let (index, vulkan_job) = match direct {
+                Some(direct) => direct,
+                None => {
+                    let index = match target.cached_buffer.position(buffer_size, target.format, false) {
+                        Some(index) => index,
+                        None => {
+                            let buffer =
+                                match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target)
+                                {
+                                    Ok(dmabuf) => SharedBuffer::Direct(dmabuf),
+                                    Err(err) => {
+                                        warn!(
+                                            "Error importing dmabuf from {} to {}: {}",
+                                            *self.render.node(),
+                                            *target.device.node(),
+                                            err
+                                        );
+                                        let dmabuf = allocate_render_buffer::<R, T>(
+                                            self.render,
+                                            target.format,
+                                            size,
+                                            dst_transform,
+                                        )?;
+
+                                        #[cfg(feature = "renderer_multi_vulkan")]
+                                        let buffer = {
+                                            let render_node = *self.render.node();
+                                            match vulkan_copy_buffer::<T>(&render_node, dmabuf, target) {
+                                                Ok(buffer) => {
+                                                    info!(
+                                                        "Copying from {} to {} through Vulkan.",
+                                                        render_node,
+                                                        *target.device.node()
+                                                    );
+                                                    buffer
+                                                }
+                                                Err((dmabuf, err)) => {
+                                                    info!("Vulkan copies unavailable: {}", err);
+                                                    info!("Falling back to cpu-copy.");
+                                                    SharedBuffer::CpuCopy(dmabuf)
+                                                }
+                                            }
+                                        };
+                                        #[cfg(not(feature = "renderer_multi_vulkan"))]
+                                        let buffer = {
+                                            info!("Falling back to cpu-copy.");
+                                            SharedBuffer::CpuCopy(dmabuf)
+                                        };
+                                        buffer
+                                    }
+                                };
+                            target.cached_buffer.push(target.format, buffer)
                         }
                     };
-                    target.cached_buffer.push(target.format, buffer)
+                    (index, target.cached_buffer.get_mut(index).vulkan_job())
                 }
             };
 
@@ -1493,7 +1630,6 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
-            let vulkan_job = target.cached_buffer.get_mut(index).vulkan_job();
             let framebuffer = self
                 .render
                 .renderer_mut()
@@ -1848,15 +1984,23 @@ where
             let buffer_size = self.size.to_logical(1).to_buffer(1, Transform::Normal);
             if let Some(target) = self.target.as_mut() {
                 #[cfg(feature = "renderer_multi_vulkan")]
-                if let Some(job) = target.vulkan_job.as_ref() {
+                if let Some(pending) = target.vulkan_job.as_ref() {
                     // The copy reads what the render gpu just drew, so let rendering finish first; waiting for
                     // the copy in turn keeps the target from reading a half-written buffer.
                     if sync.wait().is_err() && sync.wait().is_err() {
                         warn!("Interrupted waiting for rendering to finish before a Vulkan copy");
                     }
-                    if let Err(err) = job.copy(&damage) {
+                    if let Err(err) = pending.job.copy(&damage) {
                         warn!("Vulkan copy failed: {}", err);
                         return Err(Error::ImportFailed);
+                    }
+                    if pending.direct {
+                        // The copy wrote the target's own buffer: nothing is left for the target gpu.
+                        render
+                            .renderer_mut()
+                            .cleanup_texture_cache()
+                            .map_err(Error::Render)?;
+                        return Ok(sync::SyncPoint::signaled());
                     }
                 }
 
@@ -3913,8 +4057,9 @@ where
         self.guard
             .as_mut()
             .bind(target)
-            .map(MultiFramebufferInternal::Render)
-            .map(MultiFramebuffer)
+            .map(|framebuffer| {
+                MultiFramebuffer(MultiFramebufferInternal::Render(framebuffer), Default::default())
+            })
             .map_err(Error::Render)
     }
 
