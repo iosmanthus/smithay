@@ -85,7 +85,7 @@ pub mod gbm;
 pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
-    dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf)>>,
+    dmabuf_cache: HashMap<(DrmNode, DrmNode), SharedBuffers>,
     span: tracing::Span,
 }
 
@@ -954,7 +954,7 @@ where
 
 struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
-    cached_buffer: &'target mut Option<(bool, Dmabuf)>,
+    cached_buffer: &'target mut SharedBuffers,
     format: Fourcc,
 }
 
@@ -963,6 +963,69 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
     format: Fourcc,
+}
+
+/// Buffers cached for handing frames from a render- to a target-node, one per size and format.
+///
+/// Outputs of different sizes can share a render/target pair. Keeping one buffer per pair meant reallocating
+/// it every time rendering switched between them. Entries are keyed by the format asked for.
+#[derive(Debug, Default)]
+struct SharedBuffers(Vec<(Fourcc, SharedBuffer)>);
+
+const MAX_SHARED_BUFFERS: usize = 4;
+
+#[derive(Debug)]
+enum SharedBuffer {
+    /// Rendered on the render gpu and imported as-is by the target gpu.
+    Direct(Dmabuf),
+    /// Rendered on the render gpu, then read back and uploaded through the cpu.
+    CpuCopy(Dmabuf),
+}
+
+impl SharedBuffer {
+    fn render_buffer(&self) -> &Dmabuf {
+        match self {
+            SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
+        }
+    }
+
+    fn render_buffer_mut(&mut self) -> &mut Dmabuf {
+        match self {
+            SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
+        }
+    }
+
+    /// The buffer the target gpu samples from, if it can import one.
+    fn target_buffer(&self) -> Option<&Dmabuf> {
+        match self {
+            SharedBuffer::Direct(buffer) => Some(buffer),
+            SharedBuffer::CpuCopy(_) => None,
+        }
+    }
+}
+
+impl SharedBuffers {
+    fn position(&self, size: Size<i32, BufferCoords>, format: Fourcc) -> Option<usize> {
+        self.0
+            .iter()
+            .position(|(code, buffer)| *code == format && buffer.render_buffer().size() == size)
+    }
+
+    fn push(&mut self, format: Fourcc, buffer: SharedBuffer) -> usize {
+        if self.0.len() >= MAX_SHARED_BUFFERS {
+            self.0.remove(0);
+        }
+        self.0.push((format, buffer));
+        self.0.len() - 1
+    }
+
+    fn get_mut(&mut self, index: usize) -> &mut SharedBuffer {
+        &mut self.0[index].1
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl<'frame, 'buffer, R: GraphicsApi + 'frame, T: GraphicsApi> fmt::Debug
@@ -1231,66 +1294,40 @@ where
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
-            if let Some((_, dmabuf)) = &target.cached_buffer {
-                if dmabuf.size() != buffer_size || BufferTrait::format(dmabuf).code != target.format {
-                    *target.cached_buffer = None;
-                }
-            };
-
-            if target.cached_buffer.is_none() {
-                match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
-                    Ok(dmabuf) => {
-                        *target.cached_buffer = Some((true, dmabuf));
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Error importing dmabuf from {} to {}: {}",
-                            *self.render.node(),
-                            *target.device.node(),
-                            err
-                        );
-                        info!("Falling back to cpu-copy.");
-                        let modifiers = Bind::<Dmabuf>::supported_formats(self.render.renderer())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|format| format.code == target.format)
-                            .map(|f| f.modifier)
-                            .collect::<Vec<_>>();
-                        let mut dmabuf = self
-                            .render
-                            .allocator()
-                            .create_buffer(
-                                buffer_size.w as u32,
-                                buffer_size.h as u32,
+            let index = match target.cached_buffer.position(buffer_size, target.format) {
+                Some(index) => index,
+                None => {
+                    let buffer = match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target)
+                    {
+                        Ok(dmabuf) => SharedBuffer::Direct(dmabuf),
+                        Err(err) => {
+                            warn!(
+                                "Error importing dmabuf from {} to {}: {}",
+                                *self.render.node(),
+                                *target.device.node(),
+                                err
+                            );
+                            info!("Falling back to cpu-copy.");
+                            let dmabuf = allocate_render_buffer::<R, T>(
+                                self.render,
                                 target.format,
-                                &modifiers,
-                            )
-                            .map_err(Error::AllocatorError)?;
-
-                        {
-                            // make sure we mark this as a framebuffer on render first (some GL drivers don't like us to do this later).
-                            let mut render_framebuffer = self
-                                .render
-                                .renderer_mut()
-                                .bind(&mut dmabuf)
-                                .map_err(Error::Render)?;
-                            self.render
-                                .renderer_mut()
-                                .render(&mut render_framebuffer, size, dst_transform)
-                                .map_err(Error::Render)?;
-                            // drop everything
+                                size,
+                                dst_transform,
+                            )?;
+                            SharedBuffer::CpuCopy(dmabuf)
                         }
-
-                        *target.cached_buffer = Some((false, dmabuf));
-                    }
+                    };
+                    target.cached_buffer.push(target.format, buffer)
                 }
             };
 
             // try to import on target node
-            let (direct, dmabuf) = target.cached_buffer.as_mut().unwrap();
             // TODO: We could cache that texture all the way back to the GpuManager in a HashMap<WeakDmabuf, Texture>.
-            let texture = (*direct)
-                .then(|| {
+            let texture = target
+                .cached_buffer
+                .get_mut(index)
+                .target_buffer()
+                .map(|dmabuf| {
                     target
                         .device
                         .renderer_mut()
@@ -1298,7 +1335,11 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
-            let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
+            let framebuffer = self
+                .render
+                .renderer_mut()
+                .bind(target.cached_buffer.get_mut(index).render_buffer_mut())
+                .map_err(Error::Render)?;
 
             Some((&mut target.device, framebuffer, texture, target.format))
         } else {
@@ -1401,7 +1442,7 @@ where
             result = result.and(invalidate_device_caches(device).map_err(Error::Render));
         }
         if let Some(target) = self.target.as_mut() {
-            *target.cached_buffer = None;
+            target.cached_buffer.clear();
             result = result.and(invalidate_device_caches(&mut *target.device).map_err(Error::Target));
         }
         result
@@ -1432,6 +1473,46 @@ fn cleanup_device_texture_cache<D: ApiDevice>(
         .renderer_mut()
         .cleanup_texture_cache()
         .inspect_err(|err| warn!("Error cleaning up texture cache of {}: {}", node, err))
+}
+
+/// Allocate a buffer to render into on the render gpu, in a layout of its own choosing.
+fn allocate_render_buffer<R, T: GraphicsApi>(
+    render: &mut R::Device,
+    format: Fourcc,
+    size: Size<i32, Physical>,
+    dst_transform: Transform,
+) -> Result<Dmabuf, Error<R, T>>
+where
+    R: GraphicsApi + 'static,
+    R::Error: 'static,
+    T::Error: 'static,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+{
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let modifiers = Bind::<Dmabuf>::supported_formats(render.renderer())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f.code == format)
+        .map(|f| f.modifier)
+        .collect::<Vec<_>>();
+    let mut dmabuf = render
+        .allocator()
+        .create_buffer(buffer_size.w as u32, buffer_size.h as u32, format, &modifiers)
+        .map_err(Error::AllocatorError)?;
+
+    {
+        // make sure we mark this as a framebuffer on render first (some GL drivers don't like us to do this later).
+        let mut framebuffer = render.renderer_mut().bind(&mut dmabuf).map_err(Error::Render)?;
+        render
+            .renderer_mut()
+            .render(&mut framebuffer, size, dst_transform)
+            .map_err(Error::Render)?;
+        // drop everything
+    }
+    Ok(dmabuf)
 }
 
 fn create_shared_dma_framebuffer<R, T: GraphicsApi>(
