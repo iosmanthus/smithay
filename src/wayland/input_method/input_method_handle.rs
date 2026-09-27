@@ -204,27 +204,24 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         match request {
+            // Held until the input method commits; see TextInputHandle::done.
             zwp_input_method_v2::Request::CommitString { text } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.commit_string(Some(text.clone()));
-                });
+                self.text_input_handle.queue_commit_string(text);
             }
             zwp_input_method_v2::Request::SetPreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
-                });
+                self.text_input_handle
+                    .queue_preedit_string(text, cursor_begin, cursor_end);
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.delete_surrounding_text(before_length, after_length);
-                });
+                self.text_input_handle
+                    .queue_delete_surrounding_text(before_length, after_length);
             }
             zwp_input_method_v2::Request::Commit { serial } => {
                 let current_serial = self
