@@ -107,6 +107,9 @@ desktop = []
 renderer_gl = ["gl_generator", "backend_egl"]
 renderer_glow = ["renderer_gl", "glow"]
 renderer_multi = ["backend_drm", "aliasable"]
+# Copy frames between gpus with the render gpu's Vulkan driver when no shared buffer layout exists
+# (e.g. rendering on the proprietary NVIDIA driver with outputs on another gpu).
+renderer_multi_vulkan = ["renderer_multi", "ash"]
 renderer_pixman = ["pixman"]
 renderer_test = []
 tracy_gpu_profiling = ["renderer_gl", "tracy-client"]

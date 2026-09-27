@@ -79,6 +79,8 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
 #[cfg(all(feature = "backend_gbm", feature = "backend_egl", feature = "renderer_gl"))]
 pub mod gbm;
+#[cfg(feature = "renderer_multi_vulkan")]
+pub mod vulkan_copy;
 
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
@@ -86,6 +88,7 @@ pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
     dmabuf_cache: HashMap<(DrmNode, DrmNode), SharedBuffers>,
+    vulkan_copiers: VulkanCopiers,
     span: tracing::Span,
 }
 
@@ -229,6 +232,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             api,
             devices,
             dmabuf_cache: HashMap::new(),
+            vulkan_copiers: VulkanCopiers::default(),
             span,
         })
     }
@@ -368,6 +372,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
+                    vulkan_copiers: &mut self.vulkan_copiers,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -461,6 +466,9 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
+                    // Keyed by render node, so which manager holds it does not matter; the target
+                    // borrow is the one that lives as long as TargetData.
+                    vulkan_copiers: &mut target_api.vulkan_copiers,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -956,6 +964,8 @@ struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
     cached_buffer: &'target mut SharedBuffers,
     format: Fourcc,
+    #[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(dead_code))]
+    vulkan_copiers: &'target mut VulkanCopiers,
 }
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
@@ -963,13 +973,15 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
     format: Fourcc,
+    #[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(dead_code))]
+    vulkan_job: PendingVulkanJob,
 }
 
 /// Buffers cached for handing frames from a render- to a target-node, one per size and format.
 ///
 /// Outputs of different sizes can share a render/target pair. Keeping one buffer per pair meant reallocating
-/// it every time rendering switched between them. Entries are keyed by the format asked for, which the
-/// render buffer may only match in layout (see [`layout_twin`]).
+/// it -- and for Vulkan copies re-importing it -- every time rendering switched between them. Entries are
+/// keyed by the format asked for, which the render buffer may only match in layout (see [`layout_twin`]).
 #[derive(Debug, Default)]
 struct SharedBuffers(Vec<(Fourcc, SharedBuffer)>);
 
@@ -981,18 +993,30 @@ enum SharedBuffer {
     Direct(Dmabuf),
     /// Rendered on the render gpu, then read back and uploaded through the cpu.
     CpuCopy(Dmabuf),
+    /// Rendered on the render gpu into `render`, then copied by the render gpu's Vulkan driver into
+    /// `target`, which the target gpu allocated and imports.
+    #[cfg(feature = "renderer_multi_vulkan")]
+    VulkanCopy {
+        render: Dmabuf,
+        target: Dmabuf,
+        job: Arc<vulkan_copy::CopyJob>,
+    },
 }
 
 impl SharedBuffer {
     fn render_buffer(&self) -> &Dmabuf {
         match self {
             SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
+            #[cfg(feature = "renderer_multi_vulkan")]
+            SharedBuffer::VulkanCopy { render, .. } => render,
         }
     }
 
     fn render_buffer_mut(&mut self) -> &mut Dmabuf {
         match self {
             SharedBuffer::Direct(buffer) | SharedBuffer::CpuCopy(buffer) => buffer,
+            #[cfg(feature = "renderer_multi_vulkan")]
+            SharedBuffer::VulkanCopy { render, .. } => render,
         }
     }
 
@@ -1001,7 +1025,19 @@ impl SharedBuffer {
         match self {
             SharedBuffer::Direct(buffer) => Some(buffer),
             SharedBuffer::CpuCopy(_) => None,
+            #[cfg(feature = "renderer_multi_vulkan")]
+            SharedBuffer::VulkanCopy { target, .. } => Some(target),
         }
+    }
+
+    fn vulkan_job(&self) -> PendingVulkanJob {
+        #[cfg(feature = "renderer_multi_vulkan")]
+        return match self {
+            SharedBuffer::VulkanCopy { job, .. } => Some(job.clone()),
+            _ => None,
+        };
+        #[cfg(not(feature = "renderer_multi_vulkan"))]
+        return ();
     }
 }
 
@@ -1026,6 +1062,102 @@ impl SharedBuffers {
 
     fn clear(&mut self) {
         self.0.clear();
+    }
+
+    /// Forget buffers whose Vulkan device was lost, so they are set up again on a new one.
+    fn drop_lost(&mut self) {
+        #[cfg(feature = "renderer_multi_vulkan")]
+        self.0
+            .retain(|(_, buffer)| !matches!(buffer, SharedBuffer::VulkanCopy { job, .. } if job.is_lost()));
+    }
+}
+
+/// A Vulkan copy to run once rendering finishes.
+#[cfg(feature = "renderer_multi_vulkan")]
+type PendingVulkanJob = Option<Arc<vulkan_copy::CopyJob>>;
+#[cfg(not(feature = "renderer_multi_vulkan"))]
+type PendingVulkanJob = ();
+
+/// Vulkan devices for copies, per render node, opened on first use. `None` records a failed attempt, so a
+/// render node without a usable Vulkan driver is only probed once.
+#[cfg(feature = "renderer_multi_vulkan")]
+type VulkanCopiers = HashMap<DrmNode, Option<Arc<vulkan_copy::VulkanCopier>>>;
+#[cfg(not(feature = "renderer_multi_vulkan"))]
+type VulkanCopiers = ();
+
+/// The Vulkan device for copies from `render_node`, opened on first use.
+#[cfg(feature = "renderer_multi_vulkan")]
+fn vulkan_copier(
+    render_node: &DrmNode,
+    copiers: &mut VulkanCopiers,
+) -> Option<Arc<vulkan_copy::VulkanCopier>> {
+    match copiers.get(render_node) {
+        Some(Some(copier)) if !copier.is_lost() => Some(copier.clone()),
+        Some(None) => None,
+        // Not tried yet, or the device was lost and needs replacing.
+        _ => {
+            let copier = match vulkan_copy::VulkanCopier::new(render_node) {
+                Ok(copier) => Some(Arc::new(copier)),
+                Err(err) => {
+                    info!("No Vulkan copies from {}: {}", render_node, err);
+                    None
+                }
+            };
+            copiers.insert(*render_node, copier.clone());
+            copier
+        }
+    }
+}
+
+/// Set up Vulkan copies from `render_buffer` into a `LINEAR` buffer the target allocates.
+///
+/// On failure the render buffer is handed back, so the caller can fall back to cpu copies with it.
+#[cfg(feature = "renderer_multi_vulkan")]
+fn vulkan_copy_buffer<T: GraphicsApi>(
+    render_node: &DrmNode,
+    render_buffer: Dmabuf,
+    target: &mut TargetData<'_, T>,
+) -> Result<SharedBuffer, (Dmabuf, String)>
+where
+    <T::Device as ApiDevice>::Renderer: ImportDma,
+{
+    let Some(copier) = vulkan_copier(render_node, target.vulkan_copiers) else {
+        return Err((render_buffer, "no Vulkan device for the render node".into()));
+    };
+
+    let size = render_buffer.size();
+    let target_buffer = match target.device.allocator().create_buffer(
+        size.w as u32,
+        size.h as u32,
+        target.format,
+        &[Modifier::Linear],
+    ) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            return Err((
+                render_buffer,
+                format!("target cannot allocate a LINEAR buffer: {err}"),
+            ));
+        }
+    };
+    if let Err(err) = target
+        .device
+        .renderer_mut()
+        .import_dmabuf(&target_buffer, Some(&[Rectangle::from_size(size)]))
+    {
+        return Err((
+            render_buffer,
+            format!("target cannot import its LINEAR buffer: {err:?}"),
+        ));
+    }
+
+    match copier.prepare(&render_buffer, &target_buffer) {
+        Ok(job) => Ok(SharedBuffer::VulkanCopy {
+            render: render_buffer,
+            target: target_buffer,
+            job: Arc::new(job),
+        }),
+        Err(err) => Err((render_buffer, err.to_string())),
     }
 }
 
@@ -1295,6 +1427,7 @@ where
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 
+            target.cached_buffer.drop_lost();
             let index = match target.cached_buffer.position(buffer_size, target.format) {
                 Some(index) => index,
                 None => {
@@ -1308,14 +1441,38 @@ where
                                 *target.device.node(),
                                 err
                             );
-                            info!("Falling back to cpu-copy.");
                             let dmabuf = allocate_render_buffer::<R, T>(
                                 self.render,
                                 target.format,
                                 size,
                                 dst_transform,
                             )?;
-                            SharedBuffer::CpuCopy(dmabuf)
+
+                            #[cfg(feature = "renderer_multi_vulkan")]
+                            let buffer = {
+                                let render_node = *self.render.node();
+                                match vulkan_copy_buffer::<T>(&render_node, dmabuf, target) {
+                                    Ok(buffer) => {
+                                        info!(
+                                            "Copying from {} to {} through Vulkan.",
+                                            render_node,
+                                            *target.device.node()
+                                        );
+                                        buffer
+                                    }
+                                    Err((dmabuf, err)) => {
+                                        info!("Vulkan copies unavailable: {}", err);
+                                        info!("Falling back to cpu-copy.");
+                                        SharedBuffer::CpuCopy(dmabuf)
+                                    }
+                                }
+                            };
+                            #[cfg(not(feature = "renderer_multi_vulkan"))]
+                            let buffer = {
+                                info!("Falling back to cpu-copy.");
+                                SharedBuffer::CpuCopy(dmabuf)
+                            };
+                            buffer
                         }
                     };
                     target.cached_buffer.push(target.format, buffer)
@@ -1336,13 +1493,20 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
+            let vulkan_job = target.cached_buffer.get_mut(index).vulkan_job();
             let framebuffer = self
                 .render
                 .renderer_mut()
                 .bind(target.cached_buffer.get_mut(index).render_buffer_mut())
                 .map_err(Error::Render)?;
 
-            Some((&mut target.device, framebuffer, texture, target.format))
+            Some((
+                &mut target.device,
+                framebuffer,
+                texture,
+                target.format,
+                vulkan_job,
+            ))
         } else {
             None
         };
@@ -1367,12 +1531,13 @@ where
                     .map_err(Error::Render)?
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
-                let (target_device, render_framebuffer, texture, format) = target_state.unwrap();
+                let (target_device, render_framebuffer, texture, format, vulkan_job) = target_state.unwrap();
                 target = Some(TargetFrameData {
                     device: target_device,
                     framebuffer: target_framebuffer,
                     texture,
                     format,
+                    vulkan_job,
                 });
                 let mut render_framebuffer = AliasableBox::from_unique(Box::new(render_framebuffer));
 
@@ -1682,6 +1847,19 @@ where
 
             let buffer_size = self.size.to_logical(1).to_buffer(1, Transform::Normal);
             if let Some(target) = self.target.as_mut() {
+                #[cfg(feature = "renderer_multi_vulkan")]
+                if let Some(job) = target.vulkan_job.as_ref() {
+                    // The copy reads what the render gpu just drew, so let rendering finish first; waiting for
+                    // the copy in turn keeps the target from reading a half-written buffer.
+                    if sync.wait().is_err() && sync.wait().is_err() {
+                        warn!("Interrupted waiting for rendering to finish before a Vulkan copy");
+                    }
+                    if let Err(err) = job.copy(&damage) {
+                        warn!("Vulkan copy failed: {}", err);
+                        return Err(Error::ImportFailed);
+                    }
+                }
+
                 if let Some(texture) = target.texture.as_ref() {
                     // try gpu copy
                     let damage = damage
@@ -1694,9 +1872,17 @@ where
                         .render(target.framebuffer, self.size, Transform::Normal)
                         .map_err(Error::Target)?;
                     frame.wait(&sync).map_err(Error::Target)?;
-                    frame
-                        .clear(Color32F::TRANSPARENT, &damage)
-                        .map_err(Error::Target)?;
+                    // The opaque draw below covers every damaged pixel. After a Vulkan copy, skip the clear:
+                    // on a weak target gpu it is a full extra write.
+                    #[cfg(feature = "renderer_multi_vulkan")]
+                    let clear = target.vulkan_job.is_none();
+                    #[cfg(not(feature = "renderer_multi_vulkan"))]
+                    let clear = true;
+                    if clear {
+                        frame
+                            .clear(Color32F::TRANSPARENT, &damage)
+                            .map_err(Error::Target)?;
+                    }
                     frame
                         .render_texture_from_to(
                             texture,
