@@ -968,7 +968,8 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
 /// Buffers cached for handing frames from a render- to a target-node, one per size and format.
 ///
 /// Outputs of different sizes can share a render/target pair. Keeping one buffer per pair meant reallocating
-/// it every time rendering switched between them. Entries are keyed by the format asked for.
+/// it every time rendering switched between them. Entries are keyed by the format asked for, which the
+/// render buffer may only match in layout (see [`layout_twin`]).
 #[derive(Debug, Default)]
 struct SharedBuffers(Vec<(Fourcc, SharedBuffer)>);
 
@@ -1475,6 +1476,24 @@ fn cleanup_device_texture_cache<D: ApiDevice>(
         .inspect_err(|err| warn!("Error cleaning up texture cache of {}: {}", node, err))
 }
 
+/// The format with the same memory layout, but with the padding bits as alpha or the other way round.
+///
+/// The frame is only ever copied byte for byte out of the render buffer, so either will do -- and drivers do not
+/// always allocate both: the proprietary NVIDIA driver refuses `Xrgb2101010`, yet allocates `Argb2101010`.
+fn layout_twin(format: Fourcc) -> Option<Fourcc> {
+    Some(match format {
+        Fourcc::Xrgb8888 => Fourcc::Argb8888,
+        Fourcc::Argb8888 => Fourcc::Xrgb8888,
+        Fourcc::Xbgr8888 => Fourcc::Abgr8888,
+        Fourcc::Abgr8888 => Fourcc::Xbgr8888,
+        Fourcc::Xrgb2101010 => Fourcc::Argb2101010,
+        Fourcc::Argb2101010 => Fourcc::Xrgb2101010,
+        Fourcc::Xbgr2101010 => Fourcc::Abgr2101010,
+        Fourcc::Abgr2101010 => Fourcc::Xbgr2101010,
+        _ => return None,
+    })
+}
+
 /// Allocate a buffer to render into on the render gpu, in a layout of its own choosing.
 fn allocate_render_buffer<R, T: GraphicsApi>(
     render: &mut R::Device,
@@ -1492,16 +1511,32 @@ where
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
-    let modifiers = Bind::<Dmabuf>::supported_formats(render.renderer())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|f| f.code == format)
-        .map(|f| f.modifier)
-        .collect::<Vec<_>>();
-    let mut dmabuf = render
-        .allocator()
-        .create_buffer(buffer_size.w as u32, buffer_size.h as u32, format, &modifiers)
-        .map_err(Error::AllocatorError)?;
+    let allocate = |render: &mut R::Device, code: Fourcc| {
+        let modifiers = Bind::<Dmabuf>::supported_formats(render.renderer())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.code == code)
+            .map(|f| f.modifier)
+            .collect::<Vec<_>>();
+        render
+            .allocator()
+            .create_buffer(buffer_size.w as u32, buffer_size.h as u32, code, &modifiers)
+    };
+    let mut dmabuf = match allocate(render, format) {
+        Ok(dmabuf) => dmabuf,
+        Err(err) => match layout_twin(format).map(|twin| (twin, allocate(render, twin))) {
+            Some((twin, Ok(dmabuf))) => {
+                debug!(
+                    "Cannot allocate {:?} on {}, rendering to {:?} instead",
+                    format,
+                    render.node(),
+                    twin
+                );
+                dmabuf
+            }
+            _ => return Err(Error::AllocatorError(err)),
+        },
+    };
 
     {
         // make sure we mark this as a framebuffer on render first (some GL drivers don't like us to do this later).
