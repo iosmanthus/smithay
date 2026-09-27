@@ -18,9 +18,28 @@ pub(crate) struct TextInput {
     focus: Option<WlSurface>,
     active_text_input_id: Option<ObjectId>,
     compositor_input_method: bool,
+    /// Events from the input method, held until it commits them (see [`TextInputHandle::done`]).
+    pending_input_method_events: InputMethodEvents,
+}
+
+/// What the input method asked the active text-input to do since its last commit.
+#[derive(Default, Debug)]
+struct InputMethodEvents {
+    preedit: Option<(String, i32, i32)>,
+    commit: Option<String>,
+    delete_surrounding_text: Option<(u32, u32)>,
 }
 
 impl TextInput {
+    fn active_instance(&mut self) -> Option<&mut Instance> {
+        let active_id = self.active_text_input_id.as_ref()?;
+        let surface_id = self.focus.as_ref().filter(|surface| surface.is_alive())?.id();
+        self.instances
+            .iter_mut()
+            .filter(|instance| instance.instance.id().same_client_as(&surface_id))
+            .find(|instance| &instance.instance.id() == active_id)
+    }
+
     fn with_focused_client_all_text_inputs<F>(&mut self, mut f: F)
     where
         F: FnMut(&ZwpTextInputV3, &WlSurface, u32),
@@ -74,6 +93,7 @@ impl TextInputHandle {
             instance: instance.clone(),
             serial: 0,
             pending_state: Default::default(),
+            preedit: None,
         });
     }
 
@@ -152,19 +172,84 @@ impl TextInputHandle {
         self.inner.lock().unwrap().compositor_input_method
     }
 
+    /// Hold a preedit from the input method until it commits.
+    pub(crate) fn queue_preedit_string(&self, text: String, cursor_begin: i32, cursor_end: i32) {
+        self.inner.lock().unwrap().pending_input_method_events.preedit =
+            Some((text, cursor_begin, cursor_end));
+    }
+
+    /// Hold text the input method commits until it commits its state.
+    pub(crate) fn queue_commit_string(&self, text: String) {
+        self.inner.lock().unwrap().pending_input_method_events.commit = Some(text);
+    }
+
+    /// Hold a deletion from the input method until it commits.
+    pub(crate) fn queue_delete_surrounding_text(&self, before_length: u32, after_length: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_input_method_events
+            .delete_surrounding_text = Some((before_length, after_length));
+    }
+
+    /// Send the input method's held events to the active text-input, followed by `done`.
+    ///
+    /// The events are held rather than forwarded as they arrive because `done` is also sent after
+    /// every commit from the text-input (see [`Self::acknowledge_commit`]): forwarded early, an
+    /// input method preedit would be applied, and then cleared, by that acknowledgement.
+    ///
     /// The `discard_state` is used when the input-method signaled that
     /// the state should be discarded and wrong serial sent.
     pub fn done(&self, discard_state: bool) {
         let mut inner = self.inner.lock().unwrap();
-        inner.with_active_text_input(|text_input, _, serial| {
-            if discard_state {
-                debug!("discarding text-input state due to serial");
-                // Discarding is done by sending non-matching serial.
-                text_input.done(0);
-            } else {
-                text_input.done(serial);
-            }
-        });
+        let events = mem::take(&mut inner.pending_input_method_events);
+        let Some(instance) = inner.active_instance() else {
+            return;
+        };
+        if let Some((text, cursor_begin, cursor_end)) = &events.preedit {
+            instance
+                .instance
+                .preedit_string(Some(text.clone()), *cursor_begin, *cursor_end);
+        }
+        if let Some(text) = events.commit {
+            instance.instance.commit_string(Some(text));
+        }
+        if let Some((before_length, after_length)) = events.delete_surrounding_text {
+            instance
+                .instance
+                .delete_surrounding_text(before_length, after_length);
+        }
+        // `done` clears a preedit that was not sent before it.
+        instance.preedit = events.preedit;
+        if discard_state {
+            debug!("discarding text-input state due to serial");
+            // Discarding is done by sending non-matching serial.
+            instance.instance.done(0);
+        } else {
+            instance.instance.done(instance.serial);
+        }
+    }
+
+    /// Answer a commit from `text_input` with `done`, re-sending the preedit it shows so the
+    /// `done` does not clear it.
+    ///
+    /// Clients count their commits and expect a `done` carrying that count: Chromium holds back
+    /// its cursor rectangle until the last commit is acknowledged, so without this the input
+    /// method's popup stayed where the previous text field was until the first key produced a
+    /// `done`. KWin acknowledges every commit the same way, which GTK relies on too.
+    fn acknowledge_commit(&self, text_input: &ZwpTextInputV3) {
+        let inner = self.inner.lock().unwrap();
+        let Some(instance) = inner
+            .instances
+            .iter()
+            .find(|instance| instance.instance == *text_input)
+        else {
+            return;
+        };
+        if let Some((text, cursor_begin, cursor_end)) = &instance.preedit {
+            text_input.preedit_string(Some(text.clone()), *cursor_begin, *cursor_end);
+        }
+        text_input.done(instance.serial);
     }
 
     /// Access the text-input instances for the currently focused surface.
@@ -228,11 +313,50 @@ where
         _dhandle: &wayland_server::DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
+        let commit = matches!(request, zwp_text_input_v3::Request::Commit);
         // Always increment serial to not desync with clients.
-        if matches!(request, zwp_text_input_v3::Request::Commit) {
+        if commit {
             self.handle.increment_serial(resource);
         }
+        self.process_request(state, resource, request);
+        if commit {
+            self.handle.acknowledge_commit(resource);
+        }
+    }
 
+    fn destroyed(&self, state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3) {
+        let destroyed_id = text_input.id();
+        let deactivate_im = {
+            let mut inner = self.handle.inner.lock().unwrap();
+            inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
+            let destroyed_focused = inner
+                .focus
+                .as_ref()
+                .map(|focus| focus.id().same_client_as(&destroyed_id))
+                .unwrap_or(true);
+
+            // Deactivate IM when we either lost focus entirely or destroyed text-input for the
+            // currently focused client.
+            destroyed_focused
+                && !inner
+                    .instances
+                    .iter()
+                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
+        };
+
+        if deactivate_im {
+            self.input_method_handle.deactivate_input_method(state);
+        }
+    }
+}
+
+impl TextInputUserData {
+    fn process_request<D: SeatHandler + 'static>(
+        &self,
+        state: &mut D,
+        resource: &ZwpTextInputV3,
+        request: zwp_text_input_v3::Request,
+    ) {
         // Discard requests without any active input method instance, unless the compositor
         // itself is acting as the input method for this seat (the text-injection escape hatch).
         // In that case we still process enable/commit so the focused client becomes the active
@@ -302,12 +426,19 @@ where
                 match new_state.enable {
                     Some(true) => {
                         *active_text_input_id = Some(resource.id());
+                        // Enabling resets the client's state, preedit included.
+                        if let Some(instance) = guard.instances.iter_mut().find(|i| i.instance == *resource) {
+                            instance.preedit = None;
+                        }
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.activate_input_method(state, &focus);
                     }
                     Some(false) => {
                         *active_text_input_id = None;
+                        if let Some(instance) = guard.instances.iter_mut().find(|i| i.instance == *resource) {
+                            instance.preedit = None;
+                        }
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.deactivate_input_method(state);
@@ -357,31 +488,6 @@ where
             _ => unreachable!(),
         }
     }
-
-    fn destroyed(&self, state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3) {
-        let destroyed_id = text_input.id();
-        let deactivate_im = {
-            let mut inner = self.handle.inner.lock().unwrap();
-            inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
-            let destroyed_focused = inner
-                .focus
-                .as_ref()
-                .map(|focus| focus.id().same_client_as(&destroyed_id))
-                .unwrap_or(true);
-
-            // Deactivate IM when we either lost focus entirely or destroyed text-input for the
-            // currently focused client.
-            destroyed_focused
-                && !inner
-                    .instances
-                    .iter()
-                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
-        };
-
-        if deactivate_im {
-            self.input_method_handle.deactivate_input_method(state);
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -389,6 +495,8 @@ struct Instance {
     instance: ZwpTextInputV3,
     serial: u32,
     pending_state: TextInputState,
+    /// The preedit the client shows: the last one sent before a `done`.
+    preedit: Option<(String, i32, i32)>,
 }
 
 #[derive(Debug, Default)]
