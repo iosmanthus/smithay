@@ -9,14 +9,22 @@
 //! `LINEAR` buffer, and the *render* gpu copies each finished frame into it with its own copy engine. OpenGL
 //! on that driver refuses to render into a foreign `LINEAR` buffer, but its Vulkan driver imports one as a
 //! transfer destination just fine, so the copy is done with Vulkan while rendering stays on OpenGL.
+//!
+//! The same device also uploads `wl_shm` buffers (see [`VulkanCopier::shm_upload`]). OpenGL can only
+//! upload those with the cpu, copying every pixel on the compositor's thread and competing with the client
+//! for memory bandwidth -- a full 4K frame costs 7-20 ms there. Instead the client's memory is imported
+//! into Vulkan as it is (`VK_EXT_external_memory_host`) and the gpu's copy engine pulls the damaged rows
+//! into an image that OpenGL samples, synchronised through sync_files in both directions.
 
 use std::{
+    any::Any,
     fmt,
-    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use ash::{ext, khr, vk};
@@ -26,6 +34,7 @@ use crate::{
     backend::{
         allocator::{Buffer, Fourcc, dmabuf::Dmabuf},
         drm::DrmNode,
+        renderer::sync::{Fence, Interrupted},
     },
     utils::{Buffer as BufferCoords, Rectangle},
 };
@@ -52,16 +61,27 @@ struct Inner {
     queue_family: u32,
     queue: Mutex<vk::Queue>,
     pool: Mutex<vk::CommandPool>,
+    /// What `wl_shm` uploads need, if the device has it.
+    shm: Option<ShmSupport>,
     /// Set when a copy failed, which in practice means the device was lost (e.g. across a suspend).
     lost: AtomicBool,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // SAFETY: every CopyJob holds an Arc to us, so none of the objects created from this device
-        // outlive it; waiting for idle makes sure no submitted copy is still using the pool.
+        // SAFETY: every CopyJob, HostImport and ShmImage holds an Arc to us, so none of the objects created
+        // from this device outlive it; waiting for idle makes sure no submitted copy is still using the pools.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(shm) = self.shm.as_mut() {
+                for slot in shm.slots.get_mut().unwrap().slots.drain(..) {
+                    self.device.destroy_fence(slot.fence, None);
+                    self.device.destroy_semaphore(slot.wait, None);
+                    self.device.destroy_semaphore(slot.signal, None);
+                }
+                self.device
+                    .destroy_command_pool(*shm.pool.get_mut().unwrap(), None);
+            }
             self.device
                 .destroy_command_pool(*self.pool.get_mut().unwrap(), None);
             self.device.destroy_device(None);
@@ -70,9 +90,58 @@ impl Drop for Inner {
     }
 }
 
-/// Vulkan device for the render gpu, used to copy frames into buffers the target gpu allocated.
+/// What uploading `wl_shm` buffers needs beyond the copies.
+struct ShmSupport {
+    host: ext::external_memory_host::Device,
+    semaphore_fd: khr::external_semaphore_fd::Device,
+    /// Imported host pointers and sizes must be multiples of this.
+    alignment: u64,
+    queue_family: u32,
+    /// A queue on the copy engine (a transfer-only family), so uploads run alongside rendering. `None` when
+    /// the device has no such family and uploads share the main queue.
+    queue: Option<Mutex<vk::Queue>>,
+    pool: Mutex<vk::CommandPool>,
+    slots: Mutex<UploadSlots>,
+}
+
+/// Command buffers, fences and semaphores for uploads, reused round-robin.
+#[derive(Default)]
+struct UploadSlots {
+    slots: Vec<UploadSlot>,
+    next: usize,
+}
+
+struct UploadSlot {
+    cmd: vk::CommandBuffer,
+    /// Signalled when the slot's last upload is done; unsignalled and unused before the first one.
+    fence: vk::Fence,
+    submitted: bool,
+    /// Takes a temporary sync_file payload: whatever read the destination before is done with it.
+    wait: vk::Semaphore,
+    /// Exported as a sync_file after every submit: the upload landed.
+    signal: vk::Semaphore,
+}
+
+/// Uploads in flight at once; the oldest slot is waited for when all are in use.
+const MAX_UPLOAD_SLOTS: usize = 8;
+
+/// Host imports not used for this long are dropped (the client moved to other buffers or pools).
+const IMPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Client memory kept imported (and so pinned) at most, across all clients.
+const MAX_IMPORTED_BYTES: u64 = 512 << 20;
+
+/// Vulkan device for the render gpu, used to copy frames into buffers the target gpu allocated, and to
+/// upload `wl_shm` buffers.
 pub struct VulkanCopier {
     inner: Arc<Inner>,
+    /// Client memory imported for uploads, most recently used last.
+    imports: Mutex<Vec<CachedImport>>,
+}
+
+struct CachedImport {
+    key: usize,
+    import: Arc<HostImport>,
+    last_used: Instant,
 }
 
 impl fmt::Debug for VulkanCopier {
@@ -90,6 +159,20 @@ const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ext::queue_family_foreign::NAME,
 ];
 
+/// Enabled when present, for `wl_shm` uploads.
+const SHM_EXTENSIONS: [&std::ffi::CStr; 2] =
+    [ext::external_memory_host::NAME, khr::external_semaphore_fd::NAME];
+
+/// What `open_device` hands back.
+struct OpenedDevice {
+    device: ash::Device,
+    memory_fd: khr::external_memory_fd::Device,
+    queue_family: u32,
+    queue: vk::Queue,
+    pool: vk::CommandPool,
+    shm: Option<ShmSupport>,
+}
+
 impl VulkanCopier {
     /// Open the Vulkan device backing `node`.
     pub fn new(node: &DrmNode) -> Result<Self, VulkanCopyError> {
@@ -106,17 +189,19 @@ impl VulkanCopier {
         };
 
         match Self::open_device(&entry, &instance, node) {
-            Ok((device, memory_fd, queue_family, queue, pool)) => Ok(VulkanCopier {
+            Ok(opened) => Ok(VulkanCopier {
                 inner: Arc::new(Inner {
                     _entry: entry,
                     instance,
-                    device,
-                    memory_fd,
-                    queue_family,
-                    queue: Mutex::new(queue),
-                    pool: Mutex::new(pool),
+                    device: opened.device,
+                    memory_fd: opened.memory_fd,
+                    queue_family: opened.queue_family,
+                    queue: Mutex::new(opened.queue),
+                    pool: Mutex::new(opened.pool),
+                    shm: opened.shm,
                     lost: AtomicBool::new(false),
                 }),
+                imports: Mutex::new(Vec::new()),
             }),
             Err(err) => {
                 // SAFETY: nothing else was created from this instance.
@@ -126,21 +211,11 @@ impl VulkanCopier {
         }
     }
 
-    #[allow(clippy::type_complexity)]
     fn open_device(
         _entry: &ash::Entry,
         instance: &ash::Instance,
         node: &DrmNode,
-    ) -> Result<
-        (
-            ash::Device,
-            khr::external_memory_fd::Device,
-            u32,
-            vk::Queue,
-            vk::CommandPool,
-        ),
-        VulkanCopyError,
-    > {
+    ) -> Result<OpenedDevice, VulkanCopyError> {
         let (major, minor) = (node.major() as i64, node.minor() as i64);
         // SAFETY: valid instance.
         let physical = unsafe { instance.enumerate_physical_devices()? }
@@ -179,11 +254,70 @@ impl VulkanCopier {
             .ok_or(VulkanCopyError::Unsupported("no queue family can do transfers"))?
             as u32;
 
+        // `wl_shm` uploads: importing host memory, and sync_files both ways to line up with OpenGL.
+        // SAFETY: valid physical device.
+        let exts = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        let has_shm_exts = SHM_EXTENSIONS.iter().all(|name| {
+            exts.iter()
+                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == *name))
+        });
+        let shm_alignment = has_shm_exts
+            .then(|| {
+                let mut sync_fd = vk::ExternalSemaphoreProperties::default();
+                // SAFETY: valid physical device; external semaphores are core in Vulkan 1.1.
+                unsafe {
+                    instance.get_physical_device_external_semaphore_properties(
+                        physical,
+                        &vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                        &mut sync_fd,
+                    )
+                };
+                let features = vk::ExternalSemaphoreFeatureFlags::EXPORTABLE
+                    | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE;
+                if !sync_fd.external_semaphore_features.contains(features) {
+                    return None;
+                }
+                let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+                let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+                // SAFETY: valid physical device, the extension is supported (checked above).
+                unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+                // The rounded-up size must stay within the client's mapping, which ends on a page boundary.
+                let page = rustix::param::page_size() as u64;
+                let alignment = host.min_imported_host_pointer_alignment;
+                (alignment > 0 && alignment <= page && page.is_multiple_of(alignment)).then_some(alignment)
+            })
+            .flatten();
+        // Prefer the copy engine for uploads, so they do not queue up behind rendering.
+        let shm_family = shm_alignment.map(|_| {
+            families
+                .iter()
+                .position(|f| {
+                    f.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                        && !f
+                            .queue_flags
+                            .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                })
+                .map_or(queue_family, |family| family as u32)
+        });
+
         let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
-        let ext_names = DEVICE_EXTENSIONS.map(|n| n.as_ptr());
+        let mut queues = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family)
+                .queue_priorities(&priorities),
+        ];
+        if let Some(family) = shm_family.filter(|&family| family != queue_family) {
+            queues.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&priorities),
+            );
+        }
+        let mut ext_names = DEVICE_EXTENSIONS.map(|n| n.as_ptr()).to_vec();
+        if shm_alignment.is_some() {
+            ext_names.extend(SHM_EXTENSIONS.map(|n| n.as_ptr()));
+        }
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&ext_names);
@@ -191,11 +325,14 @@ impl VulkanCopier {
         let device = unsafe { instance.create_device(physical, &create_info, None)? };
         // SAFETY: the queue was requested at creation.
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family);
-        // SAFETY: valid device.
-        let pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+        let create_pool = |family| {
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(family);
+            // SAFETY: valid device.
+            unsafe { device.create_command_pool(&pool_info, None) }
+        };
+        let pool = match create_pool(queue_family) {
             Ok(pool) => pool,
             Err(err) => {
                 // SAFETY: nothing else was created from the device.
@@ -204,8 +341,41 @@ impl VulkanCopier {
             }
         };
         let memory_fd = khr::external_memory_fd::Device::new(instance, &device);
-        info!(?node, "Vulkan copies available for this render node");
-        Ok((device, memory_fd, queue_family, queue, pool))
+
+        let shm = match (shm_alignment, shm_family) {
+            (Some(alignment), Some(family)) => match create_pool(family) {
+                Ok(shm_pool) => Some(ShmSupport {
+                    host: ext::external_memory_host::Device::new(instance, &device),
+                    semaphore_fd: khr::external_semaphore_fd::Device::new(instance, &device),
+                    alignment,
+                    queue_family: family,
+                    // SAFETY: the queue was requested at creation.
+                    queue: (family != queue_family)
+                        .then(|| Mutex::new(unsafe { device.get_device_queue(family, 0) })),
+                    pool: Mutex::new(shm_pool),
+                    slots: Mutex::new(UploadSlots::default()),
+                }),
+                Err(err) => {
+                    debug!(?err, "No command pool for wl_shm uploads");
+                    None
+                }
+            },
+            _ => None,
+        };
+        info!(
+            ?node,
+            shm_uploads = shm.is_some(),
+            shm_copy_engine = shm.as_ref().is_some_and(|shm| shm.queue.is_some()),
+            "Vulkan copies available for this render node"
+        );
+        Ok(OpenedDevice {
+            device,
+            memory_fd,
+            queue_family,
+            queue,
+            pool,
+            shm,
+        })
     }
 
     /// Whether a copy on this device failed; it should be replaced by a new one.
@@ -272,6 +442,564 @@ impl VulkanCopier {
             }
         }
     }
+
+    /// Whether this device can upload `wl_shm` buffers (see [`VulkanCopier::shm_upload`]).
+    pub fn supports_shm_uploads(&self) -> bool {
+        self.inner.shm.is_some()
+    }
+
+    /// Client memory the gpu can read directly: the `len` bytes mapped at `ptr`, cached under `key`.
+    ///
+    /// `keep_alive` is only called on a cache miss; what it returns is dropped together with the import.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr + len` must be a mapping of whole pages that stays mapped as long as the value returned by
+    /// `keep_alive` lives, and no other mapping may be passed with the same `key` meanwhile.
+    pub unsafe fn import_host_memory(
+        &self,
+        key: usize,
+        ptr: *const u8,
+        len: usize,
+        keep_alive: impl FnOnce() -> Box<dyn Any + Send + Sync>,
+    ) -> Result<Arc<HostImport>, VulkanCopyError> {
+        let now = Instant::now();
+        let mut imports = self.imports.lock().unwrap();
+        let import = match imports.iter().position(|cached| cached.key == key) {
+            Some(idx) => {
+                let mut cached = imports.remove(idx);
+                cached.last_used = now;
+                let import = cached.import.clone();
+                imports.push(cached);
+                import
+            }
+            None => {
+                // SAFETY: forwarded from the caller.
+                let import = Arc::new(unsafe { self.import(ptr, len, keep_alive())? });
+                imports.push(CachedImport {
+                    key,
+                    import: import.clone(),
+                    last_used: now,
+                });
+                import
+            }
+        };
+
+        // Forget memory the client stopped using, then the least recently used beyond the budget; imports
+        // still in flight are kept alive by their upload's fence.
+        let current = imports.len() - 1;
+        let mut idx = 0;
+        imports.retain(|cached| {
+            idx += 1;
+            idx - 1 == current || now.duration_since(cached.last_used) < IMPORT_IDLE_TIMEOUT
+        });
+        while imports.len() > 1
+            && imports.iter().map(|cached| cached.import.len).sum::<u64>() > MAX_IMPORTED_BYTES
+        {
+            imports.remove(0);
+        }
+        Ok(import)
+    }
+
+    /// # Safety
+    ///
+    /// See [`VulkanCopier::import_host_memory`].
+    unsafe fn import(
+        &self,
+        ptr: *const u8,
+        len: usize,
+        keep_alive: Box<dyn Any + Send + Sync>,
+    ) -> Result<HostImport, VulkanCopyError> {
+        let inner = &self.inner;
+        let shm = inner
+            .shm
+            .as_ref()
+            .ok_or(VulkanCopyError::Unsupported("no wl_shm uploads on this device"))?;
+        if !(ptr as u64).is_multiple_of(shm.alignment) {
+            return Err(VulkanCopyError::Unsupported(
+                "client memory is not aligned for importing",
+            ));
+        }
+        let len = (len as u64).next_multiple_of(shm.alignment);
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let device = &inner.device;
+
+        let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: valid device; the pointer is a live mapping (guaranteed by the caller). ash has no
+        // wrapper for this one.
+        unsafe {
+            (shm.host.fp().get_memory_host_pointer_properties_ext)(
+                shm.host.device(),
+                handle_type,
+                ptr.cast(),
+                &mut host_props,
+            )
+            .result()?
+        };
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let create_info = vk::BufferCreateInfo::default()
+            .push_next(&mut external)
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: valid device and create info.
+        let buffer = unsafe { device.create_buffer(&create_info, None)? };
+        let memory = (|| {
+            // SAFETY: valid buffer.
+            let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+            let bits = reqs.memory_type_bits & host_props.memory_type_bits;
+            if bits == 0 {
+                return Err(VulkanCopyError::Unsupported(
+                    "no memory type can hold the client memory",
+                ));
+            }
+            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(handle_type)
+                .host_pointer(ptr as *mut _);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .push_next(&mut import)
+                .allocation_size(len)
+                .memory_type_index(bits.trailing_zeros());
+            // SAFETY: valid device; the mapping outlives the memory (guaranteed by the caller).
+            let memory = unsafe { device.allocate_memory(&alloc, None)? };
+            // SAFETY: freshly allocated memory of a compatible type, bound once.
+            if let Err(err) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+                // SAFETY: the memory was never bound.
+                unsafe { device.free_memory(memory, None) };
+                return Err(err.into());
+            }
+            Ok(memory)
+        })();
+        match memory {
+            Ok(memory) => {
+                debug!(len, "Imported client memory for wl_shm uploads");
+                Ok(HostImport {
+                    inner: inner.clone(),
+                    buffer,
+                    memory,
+                    len,
+                    _keep_alive: keep_alive,
+                })
+            }
+            Err(err) => {
+                // SAFETY: the buffer was never bound or used.
+                unsafe { device.destroy_buffer(buffer, None) };
+                Err(err)
+            }
+        }
+    }
+
+    /// Import `dmabuf`, allocated on this gpu, as the destination of `wl_shm` uploads.
+    pub fn shm_image(&self, dmabuf: &Dmabuf) -> Result<Arc<ShmImage>, VulkanCopyError> {
+        if self.inner.shm.is_none() {
+            return Err(VulkanCopyError::Unsupported("no wl_shm uploads on this device"));
+        }
+        let format = shm_vk_format(dmabuf.format().code).ok_or(VulkanCopyError::Unsupported(
+            "no Vulkan equivalent for the buffer format",
+        ))?;
+        let image = import_image(&self.inner, dmabuf, format, vk::ImageUsageFlags::TRANSFER_DST)?;
+        Ok(Arc::new(ShmImage {
+            inner: self.inner.clone(),
+            image,
+            width: dmabuf.width() as i32,
+            height: dmabuf.height() as i32,
+        }))
+    }
+
+    /// Copy `regions` of a `wl_shm` buffer into `dst`.
+    ///
+    /// The buffer starts `offset` bytes into `src` and has `stride` bytes per row, 4 bytes per pixel.
+    /// `dst_free` must signal once `dst` may be overwritten, i.e. whatever read it before is done. The
+    /// returned fence signals once the copy landed, and keeps `src` and `dst` alive until then; `None` means
+    /// no region intersected the buffer and nothing was copied.
+    ///
+    /// After a failure the device counts as lost (see [`VulkanCopier::is_lost`]).
+    pub fn shm_upload(
+        &self,
+        src: &Arc<HostImport>,
+        offset: u64,
+        stride: u32,
+        dst: &Arc<ShmImage>,
+        regions: &[Rectangle<i32, BufferCoords>],
+        dst_free: OwnedFd,
+    ) -> Result<Option<ShmUploadFence>, VulkanCopyError> {
+        let result = self.submit_shm_upload(src, offset, stride, dst, regions, dst_free);
+        if matches!(result, Err(VulkanCopyError::Vk(_))) {
+            self.inner.lost.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn submit_shm_upload(
+        &self,
+        src: &Arc<HostImport>,
+        offset: u64,
+        stride: u32,
+        dst: &Arc<ShmImage>,
+        regions: &[Rectangle<i32, BufferCoords>],
+        dst_free: OwnedFd,
+    ) -> Result<Option<ShmUploadFence>, VulkanCopyError> {
+        let inner = &self.inner;
+        let shm = inner
+            .shm
+            .as_ref()
+            .ok_or(VulkanCopyError::Unsupported("no wl_shm uploads on this device"))?;
+        if !Arc::ptr_eq(&src.inner, inner) || !Arc::ptr_eq(&dst.inner, inner) {
+            return Err(VulkanCopyError::Unsupported(
+                "the memory or image belongs to a replaced device",
+            ));
+        }
+        if !offset.is_multiple_of(4) || !stride.is_multiple_of(4) {
+            return Err(VulkanCopyError::Unsupported("the buffer is not 4-byte aligned"));
+        }
+        let bounds = Rectangle::<i32, BufferCoords>::from_size((dst.width, dst.height).into());
+        let mut copies = Vec::with_capacity(regions.len());
+        for r in regions.iter().filter_map(|r| r.intersection(bounds)) {
+            if r.size.w <= 0 || r.size.h <= 0 {
+                continue;
+            }
+            let start = offset + r.loc.y as u64 * stride as u64 + r.loc.x as u64 * 4;
+            let end = start + (r.size.h as u64 - 1) * stride as u64 + r.size.w as u64 * 4;
+            if end > src.len {
+                return Err(VulkanCopyError::Unsupported(
+                    "the buffer reaches past the client memory",
+                ));
+            }
+            copies.push(vk::BufferImageCopy {
+                buffer_offset: start,
+                buffer_row_length: stride / 4,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D {
+                    x: r.loc.x,
+                    y: r.loc.y,
+                    z: 0,
+                },
+                image_extent: vk::Extent3D {
+                    width: r.size.w as u32,
+                    height: r.size.h as u32,
+                    depth: 1,
+                },
+            });
+        }
+        if copies.is_empty() {
+            return Ok(None);
+        }
+
+        let device = &inner.device;
+        let family = shm.queue_family;
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        // As for frame copies: the image is shared with OpenGL, so take it over from the foreign queue family
+        // and hand it back, in GENERAL to keep what is not damaged.
+        let barrier = |from, to| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(if from == family {
+                    vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(if to == family {
+                    vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(from)
+                .dst_queue_family_index(to)
+                .image(dst.image.image)
+                .subresource_range(range)
+        };
+        let foreign = vk::QUEUE_FAMILY_FOREIGN_EXT;
+
+        let mut slots = shm.slots.lock().unwrap();
+        let slot = slots.take(inner, shm)?;
+        // SAFETY: the slot's command buffer, fence and semaphores are idle (`take` waited for its last
+        // upload), the queue is externally synchronised by its lock, and `src`/`dst` stay alive until the
+        // returned fence signals.
+        unsafe {
+            device.reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(
+                slot.cmd,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(foreign, family)],
+            );
+            device.cmd_copy_buffer_to_image(
+                slot.cmd,
+                src.buffer,
+                dst.image.image,
+                vk::ImageLayout::GENERAL,
+                &copies,
+            );
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(family, foreign)],
+            );
+            device.end_command_buffer(slot.cmd)?;
+
+            // On success the semaphore owns the fd.
+            shm.semaphore_fd.import_semaphore_fd(
+                &vk::ImportSemaphoreFdInfoKHR::default()
+                    .semaphore(slot.wait)
+                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                    .fd(dst_free.as_raw_fd()),
+            )?;
+            let _ = dst_free.into_raw_fd();
+
+            let waits = [slot.wait];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let cmds = [slot.cmd];
+            let signals = [slot.signal];
+            let submit = [vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)];
+            {
+                let queue = shm.queue.as_ref().unwrap_or(&inner.queue).lock().unwrap();
+                device.queue_submit(*queue, &submit, slot.fence)?;
+            }
+            slot.submitted = true;
+
+            let fd = shm.semaphore_fd.get_semaphore_fd(
+                &vk::SemaphoreGetFdInfoKHR::default()
+                    .semaphore(slot.signal)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+            )?;
+            debug!(regions = copies.len(), "wl_shm upload submitted");
+            Ok(Some(ShmUploadFence {
+                // SAFETY: vkGetSemaphoreFdKHR hands us a new fd.
+                fd: OwnedFd::from_raw_fd(fd),
+                _src: src.clone(),
+                _dst: dst.clone(),
+            }))
+        }
+    }
+}
+
+impl UploadSlots {
+    /// The next slot to record an upload in, once its previous upload is done.
+    fn take(&mut self, inner: &Inner, shm: &ShmSupport) -> Result<&mut UploadSlot, VulkanCopyError> {
+        let device = &inner.device;
+        if self.slots.len() < MAX_UPLOAD_SLOTS && self.next == self.slots.len() {
+            let pool = shm.pool.lock().unwrap();
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(*pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let mut export = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            // SAFETY: valid device and pool (the pool is externally synchronised by the lock); on failure
+            // the objects created so far are destroyed again.
+            unsafe {
+                let cmd = device.allocate_command_buffers(&alloc)?[0];
+                let objects = (|| {
+                    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                    let wait = device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .inspect_err(|_| device.destroy_fence(fence, None))?;
+                    let signal = device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
+                        .inspect_err(|_| {
+                            device.destroy_fence(fence, None);
+                            device.destroy_semaphore(wait, None);
+                        })?;
+                    Ok::<_, vk::Result>((fence, wait, signal))
+                })();
+                match objects {
+                    Ok((fence, wait, signal)) => self.slots.push(UploadSlot {
+                        cmd,
+                        fence,
+                        submitted: false,
+                        wait,
+                        signal,
+                    }),
+                    Err(err) => {
+                        device.free_command_buffers(*pool, &[cmd]);
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+        let idx = self.next % self.slots.len();
+        self.next = (idx + 1) % MAX_UPLOAD_SLOTS;
+        let slot = &mut self.slots[idx];
+        if slot.submitted {
+            // SAFETY: valid fence, submitted with the slot's last upload.
+            unsafe {
+                device.wait_for_fences(&[slot.fence], true, u64::MAX)?;
+                device.reset_fences(&[slot.fence])?;
+            }
+            slot.submitted = false;
+        }
+        Ok(slot)
+    }
+}
+
+/// Client memory imported with [`VulkanCopier::import_host_memory`].
+pub struct HostImport {
+    inner: Arc<Inner>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    len: u64,
+    _keep_alive: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for HostImport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostImport")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for HostImport {
+    fn drop(&mut self) {
+        // SAFETY: not in use: every upload reading it holds an Arc until its copy landed. Dropped before
+        // `_keep_alive`, so the mapping is still there.
+        unsafe {
+            self.inner.device.destroy_buffer(self.buffer, None);
+            self.inner.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// The destination of `wl_shm` uploads, see [`VulkanCopier::shm_image`].
+pub struct ShmImage {
+    inner: Arc<Inner>,
+    image: Image,
+    width: i32,
+    height: i32,
+}
+
+impl fmt::Debug for ShmImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShmImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShmImage {
+    /// Whether the image was made by `copier`'s device (and not one it replaced, e.g. after a suspend).
+    pub fn is_from(&self, copier: &VulkanCopier) -> bool {
+        Arc::ptr_eq(&self.inner, &copier.inner)
+    }
+}
+
+impl Drop for ShmImage {
+    fn drop(&mut self) {
+        // Not in use: every upload writing it holds an Arc until its copy landed.
+        self.image.destroy(&self.inner);
+    }
+}
+
+/// Signalled once a `wl_shm` upload landed, as a sync_file.
+///
+/// Keeps the client memory and the destination alive until then; dropping it before blocks until the copy
+/// is done.
+pub struct ShmUploadFence {
+    fd: OwnedFd,
+    _src: Arc<HostImport>,
+    _dst: Arc<ShmImage>,
+}
+
+impl fmt::Debug for ShmUploadFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShmUploadFence")
+            .field("fd", &self.fd)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShmUploadFence {
+    fn poll(&self, timeout: Option<&rustix::time::Timespec>) -> rustix::io::Result<bool> {
+        let mut fds = [rustix::event::PollFd::new(&self.fd, rustix::event::PollFlags::IN)];
+        rustix::event::poll(&mut fds, timeout).map(|n| n > 0)
+    }
+}
+
+impl Fence for ShmUploadFence {
+    fn is_signaled(&self) -> bool {
+        self.poll(Some(&rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }))
+        .unwrap_or(false)
+    }
+
+    fn wait(&self) -> Result<(), Interrupted> {
+        loop {
+            match self.poll(None) {
+                Ok(true) => return Ok(()),
+                Ok(false) | Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => return Err(Interrupted),
+            }
+        }
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        self.fd.as_fd().try_clone_to_owned().ok()
+    }
+}
+
+impl Drop for ShmUploadFence {
+    fn drop(&mut self) {
+        // The copy must not outlive what it reads and writes.
+        if !self.is_signaled() {
+            let _ = self.wait();
+        }
+    }
+}
+
+/// Formats `wl_shm` uploads handle: 4 bytes per pixel, copied as they are.
+fn shm_vk_format(fourcc: Fourcc) -> Option<vk::Format> {
+    match fourcc {
+        Fourcc::Argb8888
+        | Fourcc::Xrgb8888
+        | Fourcc::Abgr8888
+        | Fourcc::Xbgr8888
+        | Fourcc::Argb2101010
+        | Fourcc::Xrgb2101010
+        | Fourcc::Abgr2101010
+        | Fourcc::Xbgr2101010 => vk_format(fourcc),
+        _ => None,
+    }
+}
+
+/// Whether `wl_shm` buffers in `fourcc` can be uploaded through Vulkan.
+pub fn shm_format_supported(fourcc: Fourcc) -> bool {
+    shm_vk_format(fourcc).is_some()
 }
 
 struct Image {

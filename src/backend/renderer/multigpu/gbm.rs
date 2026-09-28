@@ -270,6 +270,9 @@ impl<R: Renderer + Borrow<GlesRenderer>> ApiDevice for GbmGlesDevice<R> {
     fn can_do_cross_device_imports(&self) -> bool {
         !self.renderer.borrow().is_software()
     }
+    fn submitted_work_fence(&self) -> Option<std::os::fd::OwnedFd> {
+        self.renderer.borrow().submitted_work_fence()
+    }
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]

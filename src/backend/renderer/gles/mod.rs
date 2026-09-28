@@ -866,6 +866,14 @@ impl GlesRenderer {
         }
         None
     }
+
+    /// A native fence fd signalled once all work submitted to this renderer so far is done.
+    #[cfg(feature = "renderer_multi")]
+    pub(crate) fn submitted_work_fence(&self) -> Option<std::os::fd::OwnedFd> {
+        // SAFETY: the renderer is only used from this thread.
+        unsafe { self.egl.make_current() }.ok()?;
+        self.export_sync_point()?.export()
+    }
 }
 
 #[cfg(feature = "wayland_frontend")]
