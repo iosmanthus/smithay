@@ -5,7 +5,7 @@ use std::{
     os::unix::io::{AsFd, BorrowedFd, OwnedFd},
     ptr,
     sync::{
-        LazyLock, OnceLock, RwLock,
+        Arc, LazyLock, OnceLock, RwLock,
         mpsc::{Sender, channel},
     },
     thread,
@@ -25,10 +25,13 @@ use tracing::{debug, instrument, trace};
 //
 // To work around this problem, we spawn a separate thread whose sole purpose is dropping stuff we
 // send it through a channel. Conveniently, Pool is already Send, so there's no problem doing this.
-static DROP_THIS: LazyLock<Sender<InnerPool>> = LazyLock::new(|| {
+// Mappings that outlive their pool (see `Mapping`) are unmapped there as well.
+const DROPPING_THREAD: &str = "Shm dropping thread";
+
+static DROP_THIS: LazyLock<Sender<Box<dyn Send>>> = LazyLock::new(|| {
     let (tx, rx) = channel();
     thread::Builder::new()
-        .name("Shm dropping thread".to_owned())
+        .name(DROPPING_THREAD.to_owned())
         .spawn(move || {
             while let Ok(x) = rx.recv() {
                 profiling::scope!("dropping Pool");
@@ -96,7 +99,12 @@ impl InnerPool {
     }
 
     pub fn size(&self) -> usize {
-        self.map.read().unwrap().size
+        self.map.read().unwrap().size()
+    }
+
+    #[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(dead_code))]
+    pub fn mapping(&self) -> Arc<Mapping> {
+        self.map.read().unwrap().mapping.clone()
     }
 
     #[instrument(level = "trace", skip_all, name = "wayland_shm")]
@@ -118,7 +126,7 @@ impl InnerPool {
             guard.set((&*pool_guard as *const MemMap, false))
         });
 
-        let t = f(pool_guard.ptr as *const _, pool_guard.size);
+        let t = f(pool_guard.ptr() as *const _, pool_guard.size());
 
         // Cleanup Post-access
         SIGBUS_GUARD.with(|guard| {
@@ -154,7 +162,7 @@ impl InnerPool {
             guard.set((&*pool_guard as *const MemMap, false))
         });
 
-        let t = f(pool_guard.ptr, pool_guard.size);
+        let t = f(pool_guard.ptr(), pool_guard.size());
 
         // Cleanup Post-access
         SIGBUS_GUARD.with(|guard| {
@@ -190,69 +198,134 @@ impl Pool {
     pub fn with_data_mut<T, F: FnOnce(*mut u8, usize) -> T>(&self, f: F) -> Result<T, ()> {
         self.inner.as_ref().unwrap().with_data_mut(f)
     }
+
+    /// The pool's current mapping, which stays mapped as long as the returned value lives, even if the
+    /// pool is resized or destroyed meanwhile.
+    ///
+    /// For handing the client's memory to something that reads it outside of [`Pool::with_data`], e.g. a
+    /// gpu. Nothing may access it through the cpu: unlike in [`Pool::with_data`], a client truncating its
+    /// file would not be caught.
+    #[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(dead_code))]
+    pub fn mapping(&self) -> Arc<Mapping> {
+        self.inner.as_ref().unwrap().mapping()
+    }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        let _ = DROP_THIS.send(self.inner.take().unwrap());
+        let _ = DROP_THIS.send(Box::new(self.inner.take().unwrap()));
+    }
+}
+
+/// One mmap of a pool's fd.
+///
+/// Held by the pool, and by whatever else reads the client's memory directly (see [`Pool::mapping`]). A
+/// resize maps the fd anew; the old mapping is only unmapped once nothing holds it anymore.
+#[derive(Debug)]
+pub struct Mapping {
+    ptr: *mut u8,
+    size: usize,
+}
+
+// SAFETY: the mapping is only read through the pool's accessors, which guard against concurrent resizes.
+unsafe impl Send for Mapping {}
+// SAFETY: see above.
+unsafe impl Sync for Mapping {}
+
+#[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(dead_code))]
+impl Mapping {
+    fn empty() -> Mapping {
+        Mapping {
+            ptr: ptr::null_mut(),
+            size: 0,
+        }
+    }
+
+    /// Where the mapping starts: a page boundary.
+    pub fn ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// The length of the mapping, which covers whole pages beyond it.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        // Unmapping can take milliseconds; do it off this thread (which is the dropping thread already,
+        // if the pool was the last holder).
+        struct Unmap(*mut u8, usize);
+        // SAFETY: nothing else refers to the mapping anymore.
+        unsafe impl Send for Unmap {}
+        impl Drop for Unmap {
+            fn drop(&mut self) {
+                let _ = unsafe { unmap(self.0, self.1) };
+            }
+        }
+        let unmap = Box::new(Unmap(self.ptr, self.size));
+        if thread::current().name() == Some(DROPPING_THREAD) {
+            drop(unmap);
+        } else if let Err(unsent) = DROP_THIS.send(unmap) {
+            drop(unsent.0);
+        }
     }
 }
 
 #[derive(Debug)]
 struct MemMap {
-    ptr: *mut u8,
-    size: usize,
+    mapping: Arc<Mapping>,
 }
 
 impl MemMap {
     fn new(fd: BorrowedFd<'_>, size: NonZeroUsize) -> Result<MemMap, ()> {
         Ok(MemMap {
-            ptr: unsafe { map(fd, size) }?,
-            size: size.into(),
+            mapping: Arc::new(Mapping {
+                ptr: unsafe { map(fd, size) }?,
+                size: size.into(),
+            }),
         })
     }
 
     fn remap(&mut self, fd: BorrowedFd<'_>, newsize: NonZeroUsize) -> Result<(), ()> {
-        if self.ptr.is_null() {
+        if self.mapping.ptr.is_null() {
             return Err(());
         }
-        // memunmap cannot fail, as we are unmapping a pre-existing map
-        let _ = unsafe { unmap(self.ptr, self.size) };
-        // remap the fd with the new size
+        // Map the fd with the new size; the old mapping is unmapped once nothing else holds it.
         match unsafe { map(fd, newsize) } {
             Ok(ptr) => {
-                // update the parameters
-                self.ptr = ptr;
-                self.size = usize::from(newsize);
+                self.mapping = Arc::new(Mapping {
+                    ptr,
+                    size: usize::from(newsize),
+                });
                 Ok(())
             }
             Err(()) => {
                 // set ourselves in an empty state
-                self.ptr = ptr::null_mut();
-                self.size = 0;
+                self.mapping = Arc::new(Mapping::empty());
                 Err(())
             }
         }
     }
 
+    fn ptr(&self) -> *mut u8 {
+        self.mapping.ptr
+    }
+
     fn size(&self) -> usize {
-        self.size
+        self.mapping.size
     }
 
     fn contains(&self, ptr: *mut u8) -> bool {
-        ptr >= self.ptr && ptr < unsafe { self.ptr.add(self.size) }
+        ptr >= self.ptr() && ptr < unsafe { self.ptr().add(self.size()) }
     }
 
     fn nullify(&self) -> Result<(), ()> {
-        unsafe { nullify_map(self.ptr, self.size) }
-    }
-}
-
-impl Drop for MemMap {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            let _ = unsafe { unmap(self.ptr, self.size) };
-        }
+        unsafe { nullify_map(self.ptr(), self.size()) }
     }
 }
 
