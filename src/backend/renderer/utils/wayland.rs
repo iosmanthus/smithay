@@ -158,6 +158,8 @@ impl RendererSurfaceState {
                 if self.buffer_dimensions.is_none() {
                     // This results in us rendering nothing (can happen e.g. for failed egl-buffer-calls),
                     // but it is better than crashing the compositor for a bad buffer
+                    #[cfg(feature = "renderer_multi_vulkan")]
+                    crate::backend::renderer::multigpu::wait_for_shm_uploads(states);
                     self.reset();
                     return;
                 }
@@ -166,6 +168,9 @@ impl RendererSurfaceState {
                 self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                    // Replacing the buffer releases the old one to the client, which may then write it.
+                    #[cfg(feature = "renderer_multi_vulkan")]
+                    crate::backend::renderer::multigpu::wait_for_shm_uploads(states);
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
@@ -180,6 +185,8 @@ impl RendererSurfaceState {
                 self.textures.clear();
             }
             Some(BufferAssignment::Removed) => {
+                #[cfg(feature = "renderer_multi_vulkan")]
+                crate::backend::renderer::multigpu::wait_for_shm_uploads(states);
                 self.reset();
                 return;
             }
@@ -397,6 +404,8 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                 // release during drop. This also enables us to free resources earlier
                 // like the stored textures
                 compositor::with_states(surface, |data| {
+                    #[cfg(feature = "renderer_multi_vulkan")]
+                    crate::backend::renderer::multigpu::wait_for_shm_uploads(data);
                     if let Some(mut state) = data
                         .data_map
                         .get::<RendererSurfaceStateUserData>()

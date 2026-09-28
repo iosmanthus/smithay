@@ -74,6 +74,8 @@ use crate::{
     utils::{Buffer as BufferCoords, Physical, Rectangle, Size, Transform},
 };
 use tracing::{debug, info, info_span, instrument, trace, trace_span, warn};
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+use wayland_server::Resource;
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
@@ -313,6 +315,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             render: render.remove(0),
             target: None,
             other_renderers: others,
+            #[cfg(feature = "renderer_multi_vulkan")]
+            shm_copiers: self.vulkan_copiers.clone(),
             span: tracing::Span::current(),
         })
     }
@@ -354,6 +358,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             return Err(Error::NoDevice(*target_device));
         }
 
+        #[cfg(feature = "renderer_multi_vulkan")]
+        let shm_copiers = self.vulkan_copiers.clone();
         let (mut render, others) = self
             .devices
             .iter_mut()
@@ -375,6 +381,8 @@ impl<A: GraphicsApi> GpuManager<A> {
                     vulkan_copiers: &mut self.vulkan_copiers,
                 }),
                 other_renderers: others,
+                #[cfg(feature = "renderer_multi_vulkan")]
+                shm_copiers,
                 span: tracing::Span::current(),
             })
         } else {
@@ -382,6 +390,8 @@ impl<A: GraphicsApi> GpuManager<A> {
                 render: render.remove(0),
                 target: None,
                 other_renderers: others,
+                #[cfg(feature = "renderer_multi_vulkan")]
+                shm_copiers,
                 span: tracing::Span::current(),
             })
         }
@@ -471,6 +481,8 @@ impl<A: GraphicsApi> GpuManager<A> {
                     vulkan_copiers: &mut target_api.vulkan_copiers,
                 }),
                 other_renderers: others,
+                #[cfg(feature = "renderer_multi_vulkan")]
+                shm_copiers: render_api.vulkan_copiers.clone(),
                 span: tracing::Span::current(),
             })
         } else {
@@ -478,6 +490,8 @@ impl<A: GraphicsApi> GpuManager<A> {
                 render: render.remove(0),
                 target: None,
                 other_renderers: others,
+                #[cfg(feature = "renderer_multi_vulkan")]
+                shm_copiers: render_api.vulkan_copiers.clone(),
                 span: tracing::Span::current(),
             })
         }
@@ -778,6 +792,15 @@ pub trait ApiDevice: fmt::Debug {
     fn should_do_cross_device_exports(&self) -> bool {
         true
     }
+
+    /// Returns a native fence fd signalled once all work submitted to the renderer so far is done, if the
+    /// renderer can produce one.
+    ///
+    /// The [`MultiRenderer`] uses it to overwrite textures earlier frames sampled from another api (its
+    /// Vulkan `wl_shm` uploads). Without one, those uploads are not done.
+    fn submitted_work_fence(&self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
 }
 
 /// Renderer, that transparently copies rendering results to another gpu,
@@ -786,6 +809,9 @@ pub struct MultiRenderer<'render, 'target, R: GraphicsApi, T: GraphicsApi> {
     render: &'render mut R::Device,
     target: Option<TargetData<'target, T>>,
     other_renderers: Vec<&'render mut R::Device>,
+    /// For uploading `wl_shm` buffers on the render device.
+    #[cfg(feature = "renderer_multi_vulkan")]
+    shm_copiers: VulkanCopiers,
     span: tracing::Span,
 }
 
@@ -842,6 +868,8 @@ impl<'render, 'target, R: GraphicsApi, T: GraphicsApi> MultiRenderer<'render, 't
                 render: target.device,
                 target: None,
                 other_renderers: Vec::new(),
+                #[cfg(feature = "renderer_multi_vulkan")]
+                shm_copiers: self.shm_copiers,
                 span: self.span,
             }
         } else {
@@ -1161,17 +1189,18 @@ type PendingVulkanJob = ();
 
 /// Vulkan devices for copies, per render node, opened on first use. `None` records a failed attempt, so a
 /// render node without a usable Vulkan driver is only probed once.
+///
+/// Shared between the [`GpuManager`] and its renderers, which use it for `wl_shm` uploads.
 #[cfg(feature = "renderer_multi_vulkan")]
-type VulkanCopiers = HashMap<DrmNode, Option<Arc<vulkan_copy::VulkanCopier>>>;
+#[derive(Debug, Default, Clone)]
+struct VulkanCopiers(Arc<Mutex<HashMap<DrmNode, Option<Arc<vulkan_copy::VulkanCopier>>>>>);
 #[cfg(not(feature = "renderer_multi_vulkan"))]
 type VulkanCopiers = ();
 
 /// The Vulkan device for copies from `render_node`, opened on first use.
 #[cfg(feature = "renderer_multi_vulkan")]
-fn vulkan_copier(
-    render_node: &DrmNode,
-    copiers: &mut VulkanCopiers,
-) -> Option<Arc<vulkan_copy::VulkanCopier>> {
+fn vulkan_copier(render_node: &DrmNode, copiers: &VulkanCopiers) -> Option<Arc<vulkan_copy::VulkanCopier>> {
+    let mut copiers = copiers.0.lock().unwrap();
     match copiers.get(render_node) {
         Some(Some(copier)) if !copier.is_lost() => Some(copier.clone()),
         Some(None) => None,
@@ -2373,6 +2402,38 @@ impl MultiTexture {
             .insert(render_id, GpuSingleTexture::Direct(Box::new(texture) as Box<_>));
     }
 
+    /// Like [`MultiTexture::insert_texture`], for a texture of `dmabuf` that may only be sampled once
+    /// `sync` is reached.
+    #[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+    fn insert_dma_texture<A: GraphicsApi + 'static>(
+        &mut self,
+        render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+        texture: <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+        dmabuf: Dmabuf,
+        sync: Option<SyncPoint>,
+    ) -> bool
+    where
+        <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+    {
+        let mut tex = self.0.lock().unwrap();
+        let format = texture.format();
+        let render_id = render_id.erased();
+        if format != tex.format && tex.textures.keys().any(|id| *id != render_id) {
+            warn!(has = ?tex.format, got = ?format, "Multi-SubTexture with wrong format!");
+            return false;
+        }
+        tex.format = format;
+        tex.textures.insert(
+            render_id,
+            GpuSingleTexture::Dma {
+                texture: Box::new(texture) as Box<_>,
+                dmabuf,
+                sync,
+            },
+        );
+        true
+    }
+
     #[cfg(feature = "wayland_frontend")]
     fn insert_mapping<
         R: GraphicsApi + 'static,
@@ -2601,6 +2662,12 @@ where
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         damage: &[Rectangle<i32, BufferCoords>],
     ) -> Result<<Self as RendererSuper>::TextureId, <Self as RendererSuper>::Error> {
+        #[cfg(feature = "renderer_multi_vulkan")]
+        let damage = match self.import_shm_buffer_vulkan(buffer, surface, damage) {
+            ShmVulkanUpload::Done(texture) => return Ok(texture),
+            ShmVulkanUpload::Gl { full: true } => &[],
+            ShmVulkanUpload::Gl { full: false } => damage,
+        };
         let shm_texture = self
             .render
             .renderer_mut()
@@ -2625,6 +2692,221 @@ where
 
     fn shm_formats(&self) -> Box<dyn Iterator<Item = wl_shm::Format>> {
         ImportMemWl::shm_formats(self.render.renderer())
+    }
+}
+
+/// `wl_shm` buffers smaller than this are uploaded through OpenGL: its cpu copy is cheap for them, and
+/// importing client memory into Vulkan has a fixed cost.
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+const MIN_SHM_UPLOAD_BYTES: i64 = 1 << 20;
+
+/// Per-surface state of `wl_shm` uploads through Vulkan (see [`vulkan_copy`]), in the surface's data map.
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+#[derive(Debug, Default)]
+pub(crate) struct ShmUploads(Mutex<HashMap<DrmNode, ShmUploadState>>);
+
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+#[derive(Debug, Default)]
+struct ShmUploadState {
+    /// Where uploads land: allocated by the render device, imported into Vulkan and sampled as a dmabuf.
+    target: Option<(Dmabuf, Arc<vulkan_copy::ShmImage>)>,
+    /// Uploads that may still be reading the client's buffer, which must not be released before.
+    pending: Vec<SyncPoint>,
+    /// OpenGL's own texture of the surface missed uploads, so its next upload has to be a full one.
+    gl_stale: bool,
+}
+
+/// Blocks until uploads reading a surface's buffer are done, before the buffer is released to the client.
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+pub(crate) fn wait_for_shm_uploads(states: &SurfaceData) {
+    let Some(uploads) = states.data_map.get::<ShmUploads>() else {
+        return;
+    };
+    for state in uploads.0.lock().unwrap().values_mut() {
+        for pending in state.pending.drain(..) {
+            // Only fails if the fence cannot be polled at all; nothing better to do then.
+            let _ = pending.wait();
+        }
+    }
+}
+
+/// What came of trying to upload a `wl_shm` buffer through Vulkan.
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+enum ShmVulkanUpload {
+    Done(MultiTexture),
+    /// Upload through OpenGL instead, all of the buffer when `full`.
+    Gl {
+        full: bool,
+    },
+}
+
+#[cfg(all(feature = "renderer_multi_vulkan", feature = "wayland_frontend"))]
+impl<R: GraphicsApi, T: GraphicsApi> MultiRenderer<'_, '_, R, T>
+where
+    R: 'static,
+    <R::Device as ApiDevice>::Renderer: ImportDma,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
+{
+    /// Upload a `wl_shm` buffer with the render device's copy engine, if it is worth it and works.
+    fn import_shm_buffer_vulkan(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoords>],
+    ) -> ShmVulkanUpload {
+        // The upload target lives with the surface.
+        let Some(surface) = surface else {
+            return ShmVulkanUpload::Gl { full: false };
+        };
+        let node = *self.render.node();
+        let eligible = buffer.data::<shm::ShmBufferUserData>().and_then(|userdata| {
+            let data = userdata.data;
+            let fourcc = shm::shm_format_to_fourcc(data.format)?;
+            let bytes = data.width as i64 * data.height as i64 * 4;
+            (vulkan_copy::shm_format_supported(fourcc) && bytes >= MIN_SHM_UPLOAD_BYTES)
+                .then_some((userdata, data, fourcc))
+        });
+        let copier = eligible
+            .is_some()
+            .then(|| vulkan_copier(&node, &self.shm_copiers))
+            .flatten()
+            .filter(|copier| copier.supports_shm_uploads());
+        let (Some((userdata, data, fourcc)), Some(copier)) = (eligible, copier) else {
+            // OpenGL takes over; if it had before, its texture missed what Vulkan uploaded meanwhile.
+            let full = surface
+                .data_map
+                .get::<ShmUploads>()
+                .and_then(|uploads| {
+                    let mut states = uploads.0.lock().unwrap();
+                    let state = states.get_mut(&node)?;
+                    state.target = None;
+                    Some(std::mem::take(&mut state.gl_stale))
+                })
+                .unwrap_or(false);
+            return ShmVulkanUpload::Gl { full };
+        };
+
+        surface.data_map.insert_if_missing_threadsafe(ShmUploads::default);
+        let uploads = surface.data_map.get::<ShmUploads>().unwrap();
+        let mut states = uploads.0.lock().unwrap();
+        let state = states.entry(node).or_default();
+        match self.upload_shm(&copier, state, userdata, data, fourcc, surface, damage) {
+            Ok(texture) => ShmVulkanUpload::Done(texture),
+            Err(err) => {
+                debug!(%err, "Uploading a wl_shm buffer through Vulkan failed, using OpenGL");
+                state.target = None;
+                ShmVulkanUpload::Gl {
+                    full: std::mem::take(&mut state.gl_stale),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_shm(
+        &mut self,
+        copier: &vulkan_copy::VulkanCopier,
+        state: &mut ShmUploadState,
+        userdata: &shm::ShmBufferUserData,
+        data: shm::BufferData,
+        fourcc: Fourcc,
+        surface: &SurfaceData,
+        damage: &[Rectangle<i32, BufferCoords>],
+    ) -> Result<MultiTexture, String> {
+        let size = Size::<i32, BufferCoords>::from((data.width, data.height));
+        // Allocated again whenever the buffer changes size or format, and then filled in full.
+        let mut full = false;
+        let reusable = state.target.as_ref().is_some_and(|(dmabuf, image)| {
+            dmabuf.width() as i32 == data.width
+                && dmabuf.height() as i32 == data.height
+                && dmabuf.format().code == fourcc
+                && image.is_from(copier)
+        });
+        if !reusable {
+            state.target = None;
+            let modifiers = self
+                .render
+                .renderer()
+                .dmabuf_formats()
+                .iter()
+                .filter(|format| format.code == fourcc)
+                .map(|format| format.modifier)
+                .collect::<Vec<_>>();
+            let dmabuf = self
+                .render
+                .allocator()
+                .create_buffer(data.width as u32, data.height as u32, fourcc, &modifiers)
+                .map_err(|err| format!("allocating the target: {err}"))?;
+            let image = copier
+                .shm_image(&dmabuf)
+                .map_err(|err| format!("importing the target: {err}"))?;
+            state.target = Some((dmabuf, image));
+            full = true;
+        }
+        let (dmabuf, image) = state.target.clone().unwrap();
+
+        let mapping = userdata.pool.mapping();
+        if mapping.len() == 0 {
+            return Err("the pool is not mapped".into());
+        }
+        // SAFETY: the import holds on to the mapping, which keeps it mapped, and is cached under the
+        // mapping's own address, which cannot be reused meanwhile.
+        let import = unsafe {
+            copier.import_host_memory(
+                Arc::as_ptr(&mapping) as usize,
+                mapping.ptr(),
+                mapping.len(),
+                || Box::new(mapping.clone()),
+            )
+        }
+        .map_err(|err| format!("importing client memory: {err}"))?;
+
+        let whole = [Rectangle::from_size(size)];
+        let regions = if full || damage.is_empty() {
+            &whole[..]
+        } else {
+            damage
+        };
+        // The target may only be overwritten once earlier frames are done sampling it.
+        let target_free = self
+            .render
+            .submitted_work_fence()
+            .ok_or("the renderer has no fence for its submitted work")?;
+        let sync = copier
+            .shm_upload(
+                &import,
+                data.offset as u64,
+                data.stride as u32,
+                &image,
+                regions,
+                target_free,
+            )
+            .map_err(|err| format!("uploading: {err}"))?
+            .map(SyncPoint::from);
+
+        let texture = self
+            .render
+            .renderer_mut()
+            .import_dmabuf(&dmabuf, None)
+            .map_err(|err| format!("sampling the target: {err:?}"))?;
+        let mut multi = MultiTexture::from_surface(
+            Some(surface),
+            size,
+            Format {
+                code: fourcc,
+                modifier: Modifier::Linear,
+            },
+        );
+        let context_id = self.render.renderer().context_id();
+        if !multi.insert_dma_texture::<R>(&context_id, texture, dmabuf, sync.clone()) {
+            return Err("the texture does not match the surface's other textures".into());
+        }
+        if let Some(sync) = sync {
+            state.pending.retain(|pending| !pending.is_reached());
+            state.pending.push(sync);
+        }
+        state.gl_stale = true;
+        Ok(multi)
     }
 }
 
