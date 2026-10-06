@@ -1056,6 +1056,7 @@ enum SharedBuffer {
     VulkanDirect {
         render: Dmabuf,
         jobs: Vec<(WeakDmabuf, Option<Arc<vulkan_copy::CopyJob>>)>,
+        reads: LastRead,
     },
 }
 
@@ -1101,11 +1102,21 @@ impl SharedBuffer {
             SharedBuffer::VulkanCopy { job, .. } => Some(VulkanJob {
                 job: job.clone(),
                 direct: false,
+                reads: None,
             }),
             _ => None,
         };
         #[cfg(not(feature = "renderer_multi_vulkan"))]
         return ();
+    }
+
+    /// The last copy reading the render buffer, which rendering into it has to wait for.
+    #[cfg(feature = "renderer_multi_vulkan")]
+    fn last_read(&self) -> Option<LastRead> {
+        match self {
+            SharedBuffer::VulkanDirect { reads, .. } => Some(reads.clone()),
+            _ => None,
+        }
     }
 
     /// The copy from this buffer into the target's buffer `dst`, set up on first use. `None` if the render gpu
@@ -1116,7 +1127,7 @@ impl SharedBuffer {
         dst: &Dmabuf,
         copier: &vulkan_copy::VulkanCopier,
     ) -> Option<Arc<vulkan_copy::CopyJob>> {
-        let SharedBuffer::VulkanDirect { render, jobs } = self else {
+        let SharedBuffer::VulkanDirect { render, jobs, .. } = self else {
             return None;
         };
         // Target buffers come and go with the swapchains of the outputs sharing this buffer.
@@ -1181,6 +1192,27 @@ struct VulkanJob {
     /// The copy writes the target's own buffer (see [`SharedBuffer::VulkanDirect`]), which leaves the target
     /// gpu nothing to do.
     direct: bool,
+    /// Where a copy the cpu does not wait for leaves its fence, for the next rendering into the same buffer.
+    reads: Option<LastRead>,
+}
+
+/// The fence of the last copy reading a render buffer: rendering into the buffer again must wait for it, on
+/// the gpu. Outputs of the same size share the buffer, so this is shared too.
+#[cfg(feature = "renderer_multi_vulkan")]
+type LastRead = Arc<Mutex<Option<sync::SyncPoint>>>;
+
+/// Whether `SMITHAY_VULKAN_COPY_SYNC` asks for Vulkan copies the cpu waits for, as before they could run
+/// without. A way out if a driver mishandles the fences.
+#[cfg(feature = "renderer_multi_vulkan")]
+fn sync_copies_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let forced = std::env::var_os("SMITHAY_VULKAN_COPY_SYNC").is_some_and(|v| !v.is_empty() && v != "0");
+        if forced {
+            info!("SMITHAY_VULKAN_COPY_SYNC is set: the cpu waits for every Vulkan copy");
+        }
+        forced
+    })
 }
 #[cfg(feature = "renderer_multi_vulkan")]
 type PendingVulkanJob = Option<VulkanJob>;
@@ -1569,15 +1601,23 @@ where
                                         SharedBuffer::VulkanDirect {
                                             render,
                                             jobs: Vec::new(),
+                                            reads: LastRead::default(),
                                         },
                                     )
                                 }
                             };
-                            target
-                                .cached_buffer
-                                .get_mut(index)
-                                .direct_job(&dst, &copier)
-                                .map(|job| (index, Some(VulkanJob { job, direct: true })))
+                            let buffer = target.cached_buffer.get_mut(index);
+                            let reads = buffer.last_read();
+                            buffer.direct_job(&dst, &copier).map(|job| {
+                                (
+                                    index,
+                                    Some(VulkanJob {
+                                        job,
+                                        direct: true,
+                                        reads,
+                                    }),
+                                )
+                            })
                         }
                         None => None,
                     }
@@ -1697,6 +1737,13 @@ where
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
                 let (target_device, render_framebuffer, texture, format, vulkan_job) = target_state.unwrap();
+                // A copy the cpu did not wait for may still read the render buffer.
+                #[cfg(feature = "renderer_multi_vulkan")]
+                let last_read = vulkan_job
+                    .as_ref()
+                    .and_then(|job| job.reads.as_ref())
+                    .and_then(|reads| reads.lock().unwrap().clone())
+                    .filter(|sync| !sync.is_reached());
                 target = Some(TargetFrameData {
                     device: target_device,
                     framebuffer: target_framebuffer,
@@ -1712,7 +1759,8 @@ where
                 //  - We drop the frame before the framebuffer as we store both in `MultiFrame`
                 //  - `Frame` can't store an invalid pointer into the framebuffer, as the framebuffer is moved
                 //    to the heap and won't be moved by the compiler thanks to `AliasableBox`.
-                let frame = unsafe {
+                #[cfg_attr(not(feature = "renderer_multi_vulkan"), allow(unused_mut))]
+                let mut frame = unsafe {
                     std::mem::transmute::<
                         <<R::Device as ApiDevice>::Renderer as RendererSuper>::Frame<'_, '_>,
                         <<R::Device as ApiDevice>::Renderer as RendererSuper>::Frame<'frame, 'buffer>,
@@ -1723,6 +1771,11 @@ where
                             .map_err(Error::Render)?,
                     )
                 };
+                // Let the gpu hold this rendering until that copy is done, instead of the cpu.
+                #[cfg(feature = "renderer_multi_vulkan")]
+                if let Some(sync) = last_read {
+                    frame.wait(&sync).map_err(Error::Render)?;
+                }
                 new_framebuffer = Some(render_framebuffer);
                 frame
             }
@@ -2014,6 +2067,35 @@ where
             if let Some(target) = self.target.as_mut() {
                 #[cfg(feature = "renderer_multi_vulkan")]
                 if let Some(pending) = target.vulkan_job.as_ref() {
+                    if pending.direct && !sync_copies_forced() {
+                        // The gpu starts the copy once rendering is done, and the display shows the buffer once
+                        // the copy is done: the cpu waits for neither.
+                        let ready = sync.export();
+                        if ready.is_none() && sync.wait().is_err() && sync.wait().is_err() {
+                            warn!("Interrupted waiting for rendering to finish before a Vulkan copy");
+                        }
+                        match pending.job.copy_async(&damage, ready) {
+                            Ok(copied) => {
+                                let copied = copied.map(sync::SyncPoint::from);
+                                if let (Some(copied), Some(reads)) = (copied.as_ref(), pending.reads.as_ref())
+                                {
+                                    *reads.lock().unwrap() = Some(copied.clone());
+                                }
+                                render
+                                    .renderer_mut()
+                                    .cleanup_texture_cache()
+                                    .map_err(Error::Render)?;
+                                return Ok(copied.unwrap_or_else(sync::SyncPoint::signaled));
+                            }
+                            Err(vulkan_copy::VulkanCopyError::Unsupported(reason)) => {
+                                debug!(reason, "Vulkan copy the cpu waits for");
+                            }
+                            Err(err) => {
+                                warn!("Vulkan copy failed: {}", err);
+                                return Err(Error::ImportFailed);
+                            }
+                        }
+                    }
                     // The copy reads what the render gpu just drew, so let rendering finish first; waiting for
                     // the copy in turn keeps the target from reading a half-written buffer.
                     if sync.wait().is_err() && sync.wait().is_err() {
