@@ -15,6 +15,10 @@
 //! for memory bandwidth -- a full 4K frame costs 7-20 ms there. Instead the client's memory is imported
 //! into Vulkan as it is (`VK_EXT_external_memory_host`) and the gpu's copy engine pulls the damaged rows
 //! into an image that OpenGL samples, synchronised through sync_files in both directions.
+//!
+//! Frame copies line up the same way where the driver allows it (see [`CopyJob::copy_async`]): the copy
+//! waits for OpenGL on the gpu, and the display waits for the copy through the sync_file it signals, so the
+//! compositor's thread waits for neither.
 
 use std::{
     any::Any,
@@ -58,6 +62,8 @@ struct Inner {
     instance: ash::Instance,
     device: ash::Device,
     memory_fd: khr::external_memory_fd::Device,
+    /// sync_file import and export for semaphores, if the device has them (always with `shm`).
+    semaphore_fd: Option<khr::external_semaphore_fd::Device>,
     queue_family: u32,
     queue: Mutex<vk::Queue>,
     pool: Mutex<vk::CommandPool>,
@@ -93,7 +99,6 @@ impl Drop for Inner {
 /// What uploading `wl_shm` buffers needs beyond the copies.
 struct ShmSupport {
     host: ext::external_memory_host::Device,
-    semaphore_fd: khr::external_semaphore_fd::Device,
     /// Imported host pointers and sizes must be multiples of this.
     alignment: u64,
     queue_family: u32,
@@ -159,14 +164,18 @@ const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ext::queue_family_foreign::NAME,
 ];
 
-/// Enabled when present, for `wl_shm` uploads.
-const SHM_EXTENSIONS: [&std::ffi::CStr; 2] =
-    [ext::external_memory_host::NAME, khr::external_semaphore_fd::NAME];
+/// Enabled when present: sync_files in and out of the device, for frame copies and `wl_shm` uploads that
+/// line up with other drivers on the gpu instead of on the cpu.
+const SYNC_FD_EXTENSION: &std::ffi::CStr = khr::external_semaphore_fd::NAME;
+
+/// Enabled when present (and sync_files are), for `wl_shm` uploads.
+const SHM_EXTENSION: &std::ffi::CStr = ext::external_memory_host::NAME;
 
 /// What `open_device` hands back.
 struct OpenedDevice {
     device: ash::Device,
     memory_fd: khr::external_memory_fd::Device,
+    semaphore_fd: Option<khr::external_semaphore_fd::Device>,
     queue_family: u32,
     queue: vk::Queue,
     pool: vk::CommandPool,
@@ -195,6 +204,7 @@ impl VulkanCopier {
                     instance,
                     device: opened.device,
                     memory_fd: opened.memory_fd,
+                    semaphore_fd: opened.semaphore_fd,
                     queue_family: opened.queue_family,
                     queue: Mutex::new(opened.queue),
                     pool: Mutex::new(opened.pool),
@@ -254,30 +264,32 @@ impl VulkanCopier {
             .ok_or(VulkanCopyError::Unsupported("no queue family can do transfers"))?
             as u32;
 
-        // `wl_shm` uploads: importing host memory, and sync_files both ways to line up with OpenGL.
         // SAFETY: valid physical device.
         let exts = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-        let has_shm_exts = SHM_EXTENSIONS.iter().all(|name| {
+        let has_ext = |name: &std::ffi::CStr| {
             exts.iter()
-                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == *name))
-        });
-        let shm_alignment = has_shm_exts
+                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == name))
+        };
+        // sync_files both ways: frame copies wait for OpenGL and hand the display a fence on the gpu, and
+        // `wl_shm` uploads line up with OpenGL the same way.
+        let sync_fd = has_ext(SYNC_FD_EXTENSION) && {
+            let mut props = vk::ExternalSemaphoreProperties::default();
+            // SAFETY: valid physical device; external semaphores are core in Vulkan 1.1.
+            unsafe {
+                instance.get_physical_device_external_semaphore_properties(
+                    physical,
+                    &vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                    &mut props,
+                )
+            };
+            props.external_semaphore_features.contains(
+                vk::ExternalSemaphoreFeatureFlags::EXPORTABLE | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE,
+            )
+        };
+        // `wl_shm` uploads: importing host memory, on top of sync_files.
+        let shm_alignment = (sync_fd && has_ext(SHM_EXTENSION))
             .then(|| {
-                let mut sync_fd = vk::ExternalSemaphoreProperties::default();
-                // SAFETY: valid physical device; external semaphores are core in Vulkan 1.1.
-                unsafe {
-                    instance.get_physical_device_external_semaphore_properties(
-                        physical,
-                        &vk::PhysicalDeviceExternalSemaphoreInfo::default()
-                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
-                        &mut sync_fd,
-                    )
-                };
-                let features = vk::ExternalSemaphoreFeatureFlags::EXPORTABLE
-                    | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE;
-                if !sync_fd.external_semaphore_features.contains(features) {
-                    return None;
-                }
                 let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
                 let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
                 // SAFETY: valid physical device, the extension is supported (checked above).
@@ -315,8 +327,11 @@ impl VulkanCopier {
             );
         }
         let mut ext_names = DEVICE_EXTENSIONS.map(|n| n.as_ptr()).to_vec();
+        if sync_fd {
+            ext_names.push(SYNC_FD_EXTENSION.as_ptr());
+        }
         if shm_alignment.is_some() {
-            ext_names.extend(SHM_EXTENSIONS.map(|n| n.as_ptr()));
+            ext_names.push(SHM_EXTENSION.as_ptr());
         }
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
@@ -341,12 +356,12 @@ impl VulkanCopier {
             }
         };
         let memory_fd = khr::external_memory_fd::Device::new(instance, &device);
+        let semaphore_fd = sync_fd.then(|| khr::external_semaphore_fd::Device::new(instance, &device));
 
         let shm = match (shm_alignment, shm_family) {
             (Some(alignment), Some(family)) => match create_pool(family) {
                 Ok(shm_pool) => Some(ShmSupport {
                     host: ext::external_memory_host::Device::new(instance, &device),
-                    semaphore_fd: khr::external_semaphore_fd::Device::new(instance, &device),
                     alignment,
                     queue_family: family,
                     // SAFETY: the queue was requested at creation.
@@ -364,6 +379,7 @@ impl VulkanCopier {
         };
         info!(
             ?node,
+            async_copies = semaphore_fd.is_some(),
             shm_uploads = shm.is_some(),
             shm_copy_engine = shm.as_ref().is_some_and(|shm| shm.queue.is_some()),
             "Vulkan copies available for this render node"
@@ -371,6 +387,7 @@ impl VulkanCopier {
         Ok(OpenedDevice {
             device,
             memory_fd,
+            semaphore_fd,
             queue_family,
             queue,
             pool,
@@ -422,6 +439,12 @@ impl VulkanCopier {
                 dst: dst_image,
                 cmd: cmd[0],
                 fence,
+                in_flight: AtomicBool::new(false),
+                semaphores: inner.semaphore_fd.as_ref().and_then(|_| {
+                    create_copy_semaphores(inner)
+                        .inspect_err(|err| debug!(?err, "No semaphores for copies the cpu does not wait for"))
+                        .ok()
+                }),
                 width: src.width() as i32,
                 height: src.height() as i32,
             }),
@@ -644,6 +667,11 @@ impl VulkanCopier {
             .shm
             .as_ref()
             .ok_or(VulkanCopyError::Unsupported("no wl_shm uploads on this device"))?;
+        // Always there with `shm`.
+        let semaphore_fd = inner
+            .semaphore_fd
+            .as_ref()
+            .ok_or(VulkanCopyError::Unsupported("no sync_files on this device"))?;
         if !Arc::ptr_eq(&src.inner, inner) || !Arc::ptr_eq(&dst.inner, inner) {
             return Err(VulkanCopyError::Unsupported(
                 "the memory or image belongs to a replaced device",
@@ -762,7 +790,7 @@ impl VulkanCopier {
             device.end_command_buffer(slot.cmd)?;
 
             // On success the semaphore owns the fd.
-            shm.semaphore_fd.import_semaphore_fd(
+            semaphore_fd.import_semaphore_fd(
                 &vk::ImportSemaphoreFdInfoKHR::default()
                     .semaphore(slot.wait)
                     .flags(vk::SemaphoreImportFlags::TEMPORARY)
@@ -786,7 +814,7 @@ impl VulkanCopier {
             }
             slot.submitted = true;
 
-            let fd = shm.semaphore_fd.get_semaphore_fd(
+            let fd = semaphore_fd.get_semaphore_fd(
                 &vk::SemaphoreGetFdInfoKHR::default()
                     .semaphore(slot.signal)
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
@@ -938,30 +966,13 @@ impl fmt::Debug for ShmUploadFence {
     }
 }
 
-impl ShmUploadFence {
-    fn poll(&self, timeout: Option<&rustix::time::Timespec>) -> rustix::io::Result<bool> {
-        let mut fds = [rustix::event::PollFd::new(&self.fd, rustix::event::PollFlags::IN)];
-        rustix::event::poll(&mut fds, timeout).map(|n| n > 0)
-    }
-}
-
 impl Fence for ShmUploadFence {
     fn is_signaled(&self) -> bool {
-        self.poll(Some(&rustix::time::Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }))
-        .unwrap_or(false)
+        poll_sync_file(&self.fd, Some(&ZERO_TIMEOUT)).unwrap_or(false)
     }
 
     fn wait(&self) -> Result<(), Interrupted> {
-        loop {
-            match self.poll(None) {
-                Ok(true) => return Ok(()),
-                Ok(false) | Err(rustix::io::Errno::INTR) => continue,
-                Err(_) => return Err(Interrupted),
-            }
-        }
+        wait_sync_file(&self.fd)
     }
 
     fn is_exportable(&self) -> bool {
@@ -1136,9 +1147,21 @@ pub struct CopyJob {
     src: Image,
     dst: Image,
     cmd: vk::CommandBuffer,
+    /// Signalled when the last submitted copy is done.
     fence: vk::Fence,
+    /// A copy was submitted, and its fence has not been seen signalled (and reset) since.
+    in_flight: AtomicBool,
+    /// For copies the cpu does not wait for (see [`CopyJob::copy_async`]); `None` without sync_files.
+    semaphores: Option<CopySemaphores>,
     width: i32,
     height: i32,
+}
+
+struct CopySemaphores {
+    /// Takes a temporary sync_file payload: the render gpu finished writing the source.
+    wait: vk::Semaphore,
+    /// Exported as a sync_file after every submit: the copy landed.
+    signal: vk::Semaphore,
 }
 
 impl fmt::Debug for CopyJob {
@@ -1146,6 +1169,7 @@ impl fmt::Debug for CopyJob {
         f.debug_struct("CopyJob")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("async", &self.semaphores.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1156,19 +1180,65 @@ impl CopyJob {
     /// The caller must make sure the render gpu has finished writing the source first. After a failure
     /// the device counts as lost (see [`CopyJob::is_lost`]).
     pub fn copy(&self, regions: &[Rectangle<i32, BufferCoords>]) -> Result<(), VulkanCopyError> {
-        let result = self.submit(regions);
+        let result = self.submit_and_wait(regions);
         if result.is_err() {
             self.inner.lost.store(true, Ordering::Relaxed);
         }
         result
     }
 
-    /// Whether a copy on this job's device failed; the job and its buffers should be set up again.
+    /// Copy `regions` of the source buffer into the destination buffer, without waiting on the cpu.
+    ///
+    /// The gpu starts the copy once `ready` signals, a sync_file for the render gpu's writes to the source;
+    /// without one, the caller must make sure the source is complete. The returned fence signals once the
+    /// copy landed, and can go to the display as a sync_file. `None` if there was nothing to copy.
+    ///
+    /// Fails with [`VulkanCopyError::Unsupported`] if the device has no sync_files, and [`CopyJob::copy`]
+    /// has to do instead. After any other failure the device counts as lost.
+    pub fn copy_async(
+        self: &Arc<Self>,
+        regions: &[Rectangle<i32, BufferCoords>],
+        ready: Option<OwnedFd>,
+    ) -> Result<Option<FrameCopyFence>, VulkanCopyError> {
+        let (Some(semaphores), Some(semaphore_fd)) =
+            (self.semaphores.as_ref(), self.inner.semaphore_fd.as_ref())
+        else {
+            return Err(VulkanCopyError::Unsupported("no sync_files for this copy"));
+        };
+        let result = self.submit_async(semaphores, semaphore_fd, regions, ready);
+        if result.is_err() {
+            self.inner.lost.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Whether a copy on this job's device failed; the job should be replaced along with the device.
     pub fn is_lost(&self) -> bool {
         self.inner.lost.load(Ordering::Relaxed)
     }
 
-    fn submit(&self, regions: &[Rectangle<i32, BufferCoords>]) -> Result<(), VulkanCopyError> {
+    /// Make the command buffer and fence reusable. Normally the last copy landed long ago: the display only
+    /// lets go of a buffer after showing it, and it shows it only after the copy into it is done.
+    fn reclaim(&self) -> Result<(), VulkanCopyError> {
+        if !self.in_flight.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let device = &self.inner.device;
+        // SAFETY: valid fence, submitted with the last copy.
+        unsafe {
+            if !device.get_fence_status(self.fence)? {
+                debug!("Reusing a copy job whose last copy is still running");
+                device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            }
+            device.reset_fences(&[self.fence])?;
+        }
+        self.in_flight.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Record the copy of `regions` into the command buffer: the number of rectangles, `None` if there is
+    /// nothing to copy.
+    fn record(&self, regions: &[Rectangle<i32, BufferCoords>]) -> Result<Option<usize>, VulkanCopyError> {
         let bounds = Rectangle::<i32, BufferCoords>::from_size((self.width, self.height).into());
         let copies = regions
             .iter()
@@ -1200,7 +1270,7 @@ impl CopyJob {
             })
             .collect::<Vec<_>>();
         if copies.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let device = &self.inner.device;
@@ -1244,8 +1314,7 @@ impl CopyJob {
             barrier(self.dst.image, vk::AccessFlags::TRANSFER_WRITE, family, foreign),
         ];
 
-        // SAFETY: the command buffer and fence belong to this job and are idle (every copy waits for its
-        // fence before returning), and the queue is externally synchronised by the lock.
+        // SAFETY: the command buffer belongs to this job and is idle (`reclaim` saw its last copy done).
         unsafe {
             device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(
@@ -1279,7 +1348,19 @@ impl CopyJob {
                 &release,
             );
             device.end_command_buffer(self.cmd)?;
+        }
+        Ok(Some(copies.len()))
+    }
 
+    fn submit_and_wait(&self, regions: &[Rectangle<i32, BufferCoords>]) -> Result<(), VulkanCopyError> {
+        self.reclaim()?;
+        let Some(count) = self.record(regions)? else {
+            return Ok(());
+        };
+        let device = &self.inner.device;
+        // SAFETY: the command buffer was just recorded, the fence is unsignalled (`reclaim`), and the queue is
+        // externally synchronised by the lock.
+        unsafe {
             let cmds = [self.cmd];
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
             {
@@ -1290,22 +1371,172 @@ impl CopyJob {
             device.reset_fences(&[self.fence])?;
             waited?;
         }
-        debug!(regions = copies.len(), "vulkan copy done");
+        debug!(regions = count, "vulkan copy done");
         Ok(())
+    }
+
+    fn submit_async(
+        self: &Arc<Self>,
+        semaphores: &CopySemaphores,
+        semaphore_fd: &khr::external_semaphore_fd::Device,
+        regions: &[Rectangle<i32, BufferCoords>],
+        ready: Option<OwnedFd>,
+    ) -> Result<Option<FrameCopyFence>, VulkanCopyError> {
+        self.reclaim()?;
+        let Some(count) = self.record(regions)? else {
+            return Ok(None);
+        };
+        let device = &self.inner.device;
+        // SAFETY: the command buffer was just recorded, the fence is unsignalled (`reclaim`), the semaphores
+        // belong to this job and have no pending operations (every signal was exported, which consumes it, and
+        // every temporary payload was waited for), and the queue is externally synchronised by the lock.
+        unsafe {
+            let waited_on = match ready {
+                Some(ready) => {
+                    let imported = semaphore_fd.import_semaphore_fd(
+                        &vk::ImportSemaphoreFdInfoKHR::default()
+                            .semaphore(semaphores.wait)
+                            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                            .fd(ready.as_raw_fd()),
+                    );
+                    match imported {
+                        // On success the semaphore owns the fd.
+                        Ok(()) => {
+                            let _ = ready.into_raw_fd();
+                            true
+                        }
+                        Err(err) => {
+                            debug!(?err, "Cannot wait for rendering on the gpu, waiting on the cpu");
+                            let _ = wait_sync_file(&ready);
+                            false
+                        }
+                    }
+                }
+                None => false,
+            };
+            let wait_list = [semaphores.wait];
+            let waits: &[vk::Semaphore] = if waited_on { &wait_list } else { &[] };
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let cmds = [self.cmd];
+            let signals = [semaphores.signal];
+            let submit = [vk::SubmitInfo::default()
+                .wait_semaphores(waits)
+                .wait_dst_stage_mask(&wait_stages[..waits.len()])
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)];
+            {
+                let queue = self.inner.queue.lock().unwrap();
+                device.queue_submit(*queue, &submit, self.fence)?;
+            }
+            self.in_flight.store(true, Ordering::Relaxed);
+
+            let fd = semaphore_fd.get_semaphore_fd(
+                &vk::SemaphoreGetFdInfoKHR::default()
+                    .semaphore(semaphores.signal)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+            )?;
+            debug!(regions = count, gpu_wait = waited_on, "vulkan copy submitted");
+            Ok(Some(FrameCopyFence {
+                // SAFETY: vkGetSemaphoreFdKHR hands us a new fd.
+                fd: OwnedFd::from_raw_fd(fd),
+                _job: self.clone(),
+            }))
+        }
     }
 }
 
 impl Drop for CopyJob {
     fn drop(&mut self) {
         let inner = &self.inner;
-        // SAFETY: copies always wait for their fence, so nothing here is in flight.
+        // SAFETY: a copy still in flight is waited for first, so none of the objects is in use any more.
         unsafe {
+            if *self.in_flight.get_mut() {
+                let _ = inner.device.wait_for_fences(&[self.fence], true, u64::MAX);
+            }
             let pool = inner.pool.lock().unwrap();
             inner.device.free_command_buffers(*pool, &[self.cmd]);
             drop(pool);
             inner.device.destroy_fence(self.fence, None);
+            if let Some(semaphores) = self.semaphores.take() {
+                inner.device.destroy_semaphore(semaphores.wait, None);
+                inner.device.destroy_semaphore(semaphores.signal, None);
+            }
         }
         self.src.destroy(inner);
         self.dst.destroy(inner);
+    }
+}
+
+/// Signalled once a frame copy landed, as a sync_file (see [`CopyJob::copy_async`]).
+///
+/// Holds on to the job, so the buffers it reads and writes stay imported until the copy is done.
+pub struct FrameCopyFence {
+    fd: OwnedFd,
+    _job: Arc<CopyJob>,
+}
+
+impl fmt::Debug for FrameCopyFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameCopyFence")
+            .field("fd", &self.fd)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fence for FrameCopyFence {
+    fn is_signaled(&self) -> bool {
+        poll_sync_file(&self.fd, Some(&ZERO_TIMEOUT)).unwrap_or(false)
+    }
+
+    fn wait(&self) -> Result<(), Interrupted> {
+        wait_sync_file(&self.fd)
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        self.fd.as_fd().try_clone_to_owned().ok()
+    }
+}
+
+const ZERO_TIMEOUT: rustix::time::Timespec = rustix::time::Timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+};
+
+/// Whether `fd`, a sync_file, signalled within `timeout` (forever if `None`).
+fn poll_sync_file(fd: &OwnedFd, timeout: Option<&rustix::time::Timespec>) -> rustix::io::Result<bool> {
+    let mut fds = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
+    rustix::event::poll(&mut fds, timeout).map(|n| n > 0)
+}
+
+/// Block until `fd`, a sync_file, signals.
+fn wait_sync_file(fd: &OwnedFd) -> Result<(), Interrupted> {
+    loop {
+        match poll_sync_file(fd, None) {
+            Ok(true) => return Ok(()),
+            Ok(false) | Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return Err(Interrupted),
+        }
+    }
+}
+
+fn create_copy_semaphores(inner: &Inner) -> Result<CopySemaphores, vk::Result> {
+    let device = &inner.device;
+    let mut export =
+        vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    // SAFETY: valid device; on failure the semaphore created first is destroyed again.
+    unsafe {
+        let wait = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+        match device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None) {
+            Ok(signal) => Ok(CopySemaphores { wait, signal }),
+            Err(err) => {
+                device.destroy_semaphore(wait, None);
+                Err(err)
+            }
+        }
     }
 }
