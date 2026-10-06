@@ -2856,7 +2856,7 @@ where
                 Arc::as_ptr(&mapping) as usize,
                 mapping.ptr(),
                 mapping.len(),
-                || Box::new(mapping.clone()),
+                || mapping.clone(),
             )
         }
         .map_err(|err| format!("importing client memory: {err}"))?;
