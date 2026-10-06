@@ -28,7 +28,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use ash::{ext, khr, vk};
@@ -130,8 +129,6 @@ struct UploadSlot {
 /// Uploads in flight at once; the oldest slot is waited for when all are in use.
 const MAX_UPLOAD_SLOTS: usize = 8;
 
-/// Host imports not used for this long are dropped (the client moved to other buffers or pools).
-const IMPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Client memory kept imported (and so pinned) at most, across all clients.
 const MAX_IMPORTED_BYTES: u64 = 512 << 20;
 
@@ -146,7 +143,6 @@ pub struct VulkanCopier {
 struct CachedImport {
     key: usize,
     import: Arc<HostImport>,
-    last_used: Instant,
 }
 
 impl fmt::Debug for VulkanCopier {
@@ -473,48 +469,55 @@ impl VulkanCopier {
 
     /// Client memory the gpu can read directly: the `len` bytes mapped at `ptr`, cached under `key`.
     ///
-    /// `keep_alive` is only called on a cache miss; what it returns is dropped together with the import.
+    /// `owner` is only called on a cache miss. What it returns is held as long as the import, and the import
+    /// is forgotten once it holds the last reference: the client destroyed or resized the memory, so it will
+    /// not come back. Until then it stays imported however long the client pauses, since importing pins the
+    /// memory again (2-6 ms for a 4K buffer) on the compositor's thread.
     ///
     /// # Safety
     ///
     /// `ptr..ptr + len` must be a mapping of whole pages that stays mapped as long as the value returned by
-    /// `keep_alive` lives, and no other mapping may be passed with the same `key` meanwhile.
+    /// `owner` lives, and no other mapping may be passed with the same `key` meanwhile.
     pub unsafe fn import_host_memory(
         &self,
         key: usize,
         ptr: *const u8,
         len: usize,
-        keep_alive: impl FnOnce() -> Box<dyn Any + Send + Sync>,
+        owner: impl FnOnce() -> Arc<dyn Any + Send + Sync>,
     ) -> Result<Arc<HostImport>, VulkanCopyError> {
-        let now = Instant::now();
         let mut imports = self.imports.lock().unwrap();
         let import = match imports.iter().position(|cached| cached.key == key) {
             Some(idx) => {
-                let mut cached = imports.remove(idx);
-                cached.last_used = now;
+                let cached = imports.remove(idx);
                 let import = cached.import.clone();
                 imports.push(cached);
                 import
             }
             None => {
                 // SAFETY: forwarded from the caller.
-                let import = Arc::new(unsafe { self.import(ptr, len, keep_alive())? });
+                let import = Arc::new(unsafe { self.import(ptr, len, owner())? });
                 imports.push(CachedImport {
                     key,
                     import: import.clone(),
-                    last_used: now,
                 });
                 import
             }
         };
 
-        // Forget memory the client stopped using, then the least recently used beyond the budget; imports
-        // still in flight are kept alive by their upload's fence.
+        // Forget memory the client let go of, then the least recently used beyond the budget; imports still
+        // in flight are kept alive by their upload's fence.
         let current = imports.len() - 1;
         let mut idx = 0;
         imports.retain(|cached| {
             idx += 1;
-            idx - 1 == current || now.duration_since(cached.last_used) < IMPORT_IDLE_TIMEOUT
+            let keep = idx - 1 == current || !cached.import.is_orphaned();
+            if !keep {
+                debug!(
+                    len = cached.import.len,
+                    "Forgetting client memory the client let go of"
+                );
+            }
+            keep
         });
         while imports.len() > 1
             && imports.iter().map(|cached| cached.import.len).sum::<u64>() > MAX_IMPORTED_BYTES
@@ -531,7 +534,7 @@ impl VulkanCopier {
         &self,
         ptr: *const u8,
         len: usize,
-        keep_alive: Box<dyn Any + Send + Sync>,
+        owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<HostImport, VulkanCopyError> {
         let inner = &self.inner;
         let shm = inner
@@ -601,7 +604,7 @@ impl VulkanCopier {
                     buffer,
                     memory,
                     len,
-                    _keep_alive: keep_alive,
+                    owner,
                 })
             }
             Err(err) => {
@@ -895,7 +898,15 @@ pub struct HostImport {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     len: u64,
-    _keep_alive: Box<dyn Any + Send + Sync>,
+    /// Keeps the memory mapped (see [`VulkanCopier::import_host_memory`]).
+    owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl HostImport {
+    /// Whether only this import still holds on to its memory, so the client is done with it.
+    fn is_orphaned(&self) -> bool {
+        Arc::strong_count(&self.owner) == 1
+    }
 }
 
 impl fmt::Debug for HostImport {
@@ -909,7 +920,7 @@ impl fmt::Debug for HostImport {
 impl Drop for HostImport {
     fn drop(&mut self) {
         // SAFETY: not in use: every upload reading it holds an Arc until its copy landed. Dropped before
-        // `_keep_alive`, so the mapping is still there.
+        // `owner`, so the mapping is still there.
         unsafe {
             self.inner.device.destroy_buffer(self.buffer, None);
             self.inner.device.free_memory(self.memory, None);
