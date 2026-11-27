@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -24,10 +25,11 @@ use zwp_primary_selection_offer_v1::Request as PrimaryRequest;
 
 use crate::input::Seat;
 
-use super::SelectionHandler;
 use super::device::{DataDeviceKind, SelectionDevice};
 use super::private::selection_dispatch;
+use super::seat_data::SeatData;
 use super::source::{CompositorSelectionProvider, SelectionSourceProvider};
+use super::{SelectionHandler, SelectionRead, SelectionReadSource, SelectionSource, SelectionTarget};
 
 #[derive(Debug, Clone)]
 pub enum OfferReplySource<U: Clone + Send + Sync + 'static> {
@@ -65,11 +67,15 @@ pub(crate) enum SelectionOffer {
 }
 
 impl SelectionOffer {
+    /// An offer of the selection `data` of `target`, made on `device` when the selection had
+    /// changed `generation` times.
     pub fn new<D>(
         dh: &DisplayHandle,
         device: &SelectionDevice,
         client_id: ClientId,
         data: OfferReplySource<D::SelectionUserData>,
+        target: SelectionTarget,
+        generation: u64,
     ) -> Self
     where
         D: SelectionHandler + 'static,
@@ -82,6 +88,8 @@ impl SelectionOffer {
             device_kind,
             seat: device.seat(),
             source: data,
+            target,
+            generation,
         });
         let backend = dh.backend_handle();
 
@@ -117,6 +125,8 @@ struct OfferReplyData<U: Clone + Send + Sync + 'static> {
     device_kind: DataDeviceKind,
     source: OfferReplySource<U>,
     seat: WlSeat,
+    target: SelectionTarget,
+    generation: u64,
 }
 
 impl<D> ObjectData<D> for OfferReplyData<D::SelectionUserData>
@@ -135,39 +145,39 @@ where
         // NOTE: we can't parse message more than once, since it expects the `OwnedFd` which
         // we can't clone. To achieve that, we use RTTI passed along the selection data, to
         // make the parsing work only once.
-        let (mime_type, fd, object_name) = match self.device_kind {
+        let (reader, mime_type, fd, object_name) = match self.device_kind {
             DataDeviceKind::Core => {
-                if let Ok((_resource, DataOfferRequest::Receive { mime_type, fd })) =
+                if let Ok((resource, DataOfferRequest::Receive { mime_type, fd })) =
                     WlDataOffer::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "wl_data_offer")
+                    (resource.client(), mime_type, fd, "wl_data_offer")
                 } else {
                     return None;
                 }
             }
             DataDeviceKind::Primary => {
-                if let Ok((_resource, PrimaryRequest::Receive { mime_type, fd })) =
+                if let Ok((resource, PrimaryRequest::Receive { mime_type, fd })) =
                     PrimaryOffer::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "primary_selection_offer")
+                    (resource.client(), mime_type, fd, "primary_selection_offer")
                 } else {
                     return None;
                 }
             }
             DataDeviceKind::WlrDataControl => {
-                if let Ok((_resource, DataControlRequest::Receive { mime_type, fd })) =
+                if let Ok((resource, DataControlRequest::Receive { mime_type, fd })) =
                     ZwlrDataControlOfferV1::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "wlr_data_control_offer")
+                    (resource.client(), mime_type, fd, "wlr_data_control_offer")
                 } else {
                     return None;
                 }
             }
             DataDeviceKind::ExtDataControl => {
-                if let Ok((_resource, ext_data_control_offer_v1::Request::Receive { mime_type, fd })) =
+                if let Ok((resource, ext_data_control_offer_v1::Request::Receive { mime_type, fd })) =
                     ExtDataControlOfferV1::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "ext_data_control_offer")
+                    (resource.client(), mime_type, fd, "ext_data_control_offer")
                 } else {
                     return None;
                 }
@@ -176,18 +186,38 @@ where
 
         if !self.source.contains_mime_type(&mime_type) {
             debug!("Denying a {object_name}.receive with invalid mime type");
-        } else {
-            match &self.source {
-                OfferReplySource::Client(source) => {
-                    source.send(mime_type, fd);
-                }
-                OfferReplySource::Compositor(source) => {
-                    if let Some(seat) = Seat::<D>::from_resource(&self.seat) {
-                        handle.send_selection(source.ty, mime_type, fd, seat, &source.user_data);
-                    }
-                }
-            }
+            return None;
         }
+
+        let (Some(reader), Some(seat)) = (reader, Seat::<D>::from_resource(&self.seat)) else {
+            // Without a seat there is nobody to ask; a client source can still serve the read.
+            if let OfferReplySource::Client(source) = &self.source {
+                source.send(mime_type, fd);
+            }
+            return None;
+        };
+        let current = seat
+            .user_data()
+            .get::<RefCell<SeatData<D::SelectionUserData>>>()
+            .is_some_and(|data| data.borrow().generation(self.target) == self.generation);
+        let source = match &self.source {
+            OfferReplySource::Client(provider) => SelectionReadSource::Client(SelectionSource {
+                provider: provider.clone(),
+            }),
+            OfferReplySource::Compositor(source) => {
+                debug_assert_eq!(source.ty, self.target);
+                SelectionReadSource::Compositor(source.user_data.clone())
+            }
+        };
+        let read = SelectionRead {
+            target: self.target,
+            device_kind: self.device_kind,
+            reader,
+            source,
+            mime_type,
+            current,
+        };
+        handle.receive_selection(read, fd, seat);
 
         None
     }

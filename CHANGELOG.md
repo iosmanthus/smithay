@@ -125,6 +125,17 @@ is used for timestamps for synthesized events.
 
 ### Additions
 
+- `SelectionHandler::receive_selection` and `DataDeviceHandler::receive_dnd` are
+  called for every read of a selection (clipboard, primary selection and data
+  control) and of a drag-and-drop offer, with the reading `Client`, the source
+  (`SelectionSource::client` names the owner of a client source), the mime type,
+  and whether the offer still is the current selection (`SelectionRead::current`)
+  or whether the drop happened (`DndRead::dropped`). The defaults serve the read
+  as before (`SelectionRead::forward`, `DndRead::forward`); a compositor can
+  refuse a read or serve it itself, for clipboard access control or to keep a
+  selection after its client is gone. `DataDeviceKind` tells which kind of
+  device a selection offer was made on.
+
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.

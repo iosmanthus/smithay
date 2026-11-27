@@ -15,6 +15,10 @@ pub(crate) struct SeatData<U: Clone + Sync + Send + 'static> {
     clipboard_selection_focus: Option<Client>,
     primary_selection: Option<OfferReplySource<U>>,
     primary_selection_focus: Option<Client>,
+    /// Counts the changes of each selection, so that an offer can tell whether it still is the
+    /// current selection.
+    clipboard_generation: u64,
+    primary_generation: u64,
 }
 
 impl<U: Clone + Send + Sync + 'static> SeatData<U> {
@@ -70,6 +74,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
             }
         }
         self.clipboard_selection = new_selection;
+        self.clipboard_generation += 1;
         self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, true)
     }
 
@@ -100,6 +105,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
             }
         }
         self.primary_selection = new_selection;
+        self.primary_generation += 1;
         self.send_selection::<D>(dh, SelectionTarget::Primary, None, true)
     }
 
@@ -111,6 +117,14 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     /// Get the current selection which will be used as a primary selection.
     pub fn get_primary_selection(&self) -> Option<&OfferReplySource<U>> {
         self.primary_selection.as_ref()
+    }
+
+    /// The number of changes of the selection of `ty` so far.
+    pub fn generation(&self, ty: SelectionTarget) -> u64 {
+        match ty {
+            SelectionTarget::Clipboard => self.clipboard_generation,
+            SelectionTarget::Primary => self.primary_generation,
+        }
     }
 
     /// Send selection for the given [`SelectionTarget`]. The data control devices should only
@@ -131,6 +145,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
+        let generation = self.generation(ty);
         let (client, selection) = match ty {
             SelectionTarget::Primary => (self.primary_selection_focus.as_ref(), &mut self.primary_selection),
             SelectionTarget::Clipboard => (
@@ -197,7 +212,8 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                         None => continue,
                     };
 
-                    let offer = SelectionOffer::new::<D>(dh, device, client_id, selection.clone());
+                    let offer =
+                        SelectionOffer::new::<D>(dh, device, client_id, selection.clone(), ty, generation);
 
                     device.offer(&offer);
 
@@ -223,6 +239,8 @@ impl<U: Clone + Send + Sync + 'static> Default for SeatData<U> {
             clipboard_selection_focus: None,
             primary_selection: None,
             primary_selection_focus: None,
+            clipboard_generation: 0,
+            primary_generation: 0,
         }
     }
 }

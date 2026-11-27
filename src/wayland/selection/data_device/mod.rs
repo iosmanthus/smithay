@@ -76,8 +76,10 @@
 //! ```
 
 use std::{
+    any::Any,
     cell::{Ref, RefCell},
     collections::HashMap,
+    fmt,
     os::unix::io::OwnedFd,
     sync::{Arc, Mutex},
 };
@@ -126,6 +128,52 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + WaylandDndGrabHandler {
     /// Action chooser for DnD negotiation
     fn action_choice(&mut self, available: WlDndAction, preferred: WlDndAction) -> WlDndAction {
         default_action_chooser(available, preferred)
+    }
+
+    /// A client asked to read the data of a drag-and-drop offer (`wl_data_offer.receive`), for a
+    /// mime type that the source offers, while the offer is active.
+    ///
+    /// The default serves the read: the source writes the data into `fd`. A compositor that
+    /// overrides this method can see who reads, from which source, and whether the drop happened
+    /// (a client may read before the drop, for example to decide whether to accept); it can then
+    /// serve the read with [`DndRead::forward`], refuse it by dropping `fd`, or write other data
+    /// into `fd`.
+    fn receive_dnd(&mut self, read: DndRead, fd: OwnedFd) {
+        read.forward(fd);
+    }
+}
+
+/// A client's request to read the data of a drag-and-drop offer, given to
+/// [`DataDeviceHandler::receive_dnd`].
+#[non_exhaustive]
+pub struct DndRead {
+    /// The client that reads.
+    pub reader: Client,
+    /// The source of the drag.
+    pub source: Arc<dyn Source>,
+    /// The client that owns the source, when the source is a client's `wl_data_source`.
+    pub source_client: Option<Client>,
+    /// The requested mime type, one that the source offers.
+    pub mime_type: String,
+    /// Whether the drop happened on the reader.
+    pub dropped: bool,
+}
+
+impl DndRead {
+    /// Serve the read as smithay does by default: the source writes the data into `fd`.
+    pub fn forward(self, fd: OwnedFd) {
+        self.source.send(&self.mime_type, fd);
+    }
+}
+
+impl fmt::Debug for DndRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DndRead")
+            .field("reader", &self.reader)
+            .field("source_client", &self.source_client)
+            .field("mime_type", &self.mime_type)
+            .field("dropped", &self.dropped)
+            .finish_non_exhaustive()
     }
 }
 
@@ -274,15 +322,28 @@ fn handle_dnd<D, S>(
             }
         }
         Request::Receive { mime_type, fd } => {
-            if let Some(source) = source.as_ref() {
+            if let Some(offered) = source.as_ref() {
                 // check if the source and associated mime type is still valid
-                let valid = source
+                let valid = offered
                     .metadata()
                     .is_some_and(|meta| meta.mime_types.contains(&mime_type))
-                    && source.alive()
+                    && offered.alive()
                     && data.active;
-                if valid {
-                    source.send(&mime_type, fd);
+                if let (true, Some(reader)) = (valid, offer.client()) {
+                    let source_client = (offered.as_ref() as &dyn Any)
+                        .downcast_ref::<WlDataSource>()
+                        .and_then(|source| source.client());
+                    let read = DndRead {
+                        reader,
+                        source: offered.clone(),
+                        source_client,
+                        mime_type,
+                        dropped: data.dropped,
+                    };
+                    // The handler may use the offer again: no lock while it runs.
+                    drop(data);
+                    drop(source);
+                    handler.receive_dnd(read, fd);
                 }
             } else if data.finished {
                 offer.post_error(
