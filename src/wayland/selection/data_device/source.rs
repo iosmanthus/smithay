@@ -133,6 +133,10 @@ impl Source for WlDataSource {
         self.send(mime_type.to_owned(), fd.as_fd());
     }
 
+    fn owner_client(&self) -> Option<wayland_server::Client> {
+        Resource::client(self)
+    }
+
     fn drop_performed(&self) {
         if self.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
             self.dnd_drop_performed();

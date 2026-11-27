@@ -6,7 +6,7 @@ use std::{any::Any, os::fd::OwnedFd, sync::Arc};
 
 use smallvec::SmallVec;
 #[cfg(feature = "wayland_frontend")]
-use wayland_server::DisplayHandle;
+use wayland_server::{Client, DisplayHandle};
 
 #[cfg(feature = "xwayland")]
 use crate::wayland::seat::WaylandFocus;
@@ -83,6 +83,12 @@ pub trait Source: IsAlive + Send + Sync + 'static {
     fn cancel(&self);
     /// The source is done
     fn finished(&self);
+
+    /// The Wayland client that owns the source, if it is a client's source.
+    #[cfg(feature = "wayland_frontend")]
+    fn owner_client(&self) -> Option<Client> {
+        None
+    }
 }
 
 /// Data associated with an offer of a [`Source`] to a particular target.

@@ -78,6 +78,7 @@
 use std::{
     cell::{Ref, RefCell},
     collections::HashMap,
+    fmt,
     os::unix::io::OwnedFd,
     sync::{Arc, Mutex},
 };
@@ -126,6 +127,57 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + WaylandDndGrabHandler {
     /// Action chooser for DnD negotiation
     fn action_choice(&mut self, available: WlDndAction, preferred: WlDndAction) -> WlDndAction {
         default_action_chooser(available, preferred)
+    }
+
+    /// A Wayland client asked to read the data of a drag-and-drop offer (`wl_data_offer.receive`),
+    /// for a mime type that the offer announced, while the offer is active. (Transfers of the
+    /// X11 window manager's XDND are not reads of a `wl_data_offer`.)
+    ///
+    /// The default serves the read: the source writes the data into `fd`. A compositor that
+    /// overrides this method can see who reads, from which source, and whether the drop happened
+    /// (a client may read before the drop, for example to decide whether to accept); it can then
+    /// serve the read with [`DndRead::forward`], refuse it by dropping `fd`, or write other data
+    /// into `fd`.
+    fn receive_dnd(&mut self, read: DndRead, fd: OwnedFd, seat: Seat<Self>) {
+        let _ = seat;
+        read.forward(fd);
+    }
+}
+
+/// A client's request to read the data of a drag-and-drop offer, given to
+/// [`DataDeviceHandler::receive_dnd`].
+#[non_exhaustive]
+pub struct DndRead {
+    /// The client that reads.
+    pub reader: Client,
+    /// The client that owns the source, when the source is a client's (see
+    /// [`Source::owner_client`]).
+    pub source_client: Option<Client>,
+    /// The requested mime type, one that the offer announced.
+    pub mime_type: String,
+    /// Whether the drop happened on the reader.
+    pub dropped: bool,
+    source: Arc<dyn Source>,
+}
+
+impl DndRead {
+    /// Serve the read as smithay does by default: the source, if it is still alive, writes the data
+    /// into `fd`.
+    pub fn forward(self, fd: OwnedFd) {
+        if self.source.alive() {
+            self.source.send(&self.mime_type, fd);
+        }
+    }
+}
+
+impl fmt::Debug for DndRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DndRead")
+            .field("reader", &self.reader)
+            .field("source_client", &self.source_client)
+            .field("mime_type", &self.mime_type)
+            .field("dropped", &self.dropped)
+            .finish_non_exhaustive()
     }
 }
 
@@ -210,6 +262,11 @@ struct WlOfferState {
 struct WlDndDataOffer<S: Source> {
     state: Arc<Mutex<WlOfferState>>,
     source: Mutex<Option<Arc<S>>>,
+    /// The mime types the offer announced; a source can add types later, which this offer did not
+    /// announce.
+    mime_types: Vec<String>,
+    /// The reader's seat.
+    seat: WlSeat,
 }
 
 impl<D, S> ObjectData<D> for WlDndDataOffer<S>
@@ -254,6 +311,7 @@ fn handle_dnd<D, S>(
     S: Source,
 {
     use self::wl_data_offer::Request;
+    let offer_data = data;
     let mut source = data.source.lock().unwrap();
     let mut data = data.state.lock().unwrap();
     match request {
@@ -274,15 +332,25 @@ fn handle_dnd<D, S>(
             }
         }
         Request::Receive { mime_type, fd } => {
-            if let Some(source) = source.as_ref() {
+            if let Some(offered) = source.as_ref() {
                 // check if the source and associated mime type is still valid
-                let valid = source
-                    .metadata()
-                    .is_some_and(|meta| meta.mime_types.contains(&mime_type))
-                    && source.alive()
-                    && data.active;
-                if valid {
-                    source.send(&mime_type, fd);
+                let valid = offer_data.mime_types.contains(&mime_type) && offered.alive() && data.active;
+                let reader = offer.client();
+                let seat = Seat::<D>::from_resource(&offer_data.seat);
+                // Every read goes through the handler, which may control access: without a seat
+                // or a reader there is nobody to ask, and the read is refused.
+                if let (true, Some(reader), Some(seat)) = (valid, reader, seat) {
+                    let read = DndRead {
+                        reader,
+                        source_client: offered.owner_client(),
+                        mime_type,
+                        dropped: data.dropped,
+                        source: offered.clone(),
+                    };
+                    // The handler may use the offer again: no lock while it runs.
+                    drop(data);
+                    drop(source);
+                    handler.receive_dnd(read, fd, seat);
                 }
             } else if data.finished {
                 offer.post_error(
@@ -467,6 +535,8 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
                         Arc::new(WlDndDataOffer {
                             state: offer_state.clone(),
                             source: Mutex::new(Some(source.clone())),
+                            mime_types: metadata.mime_types.clone(),
+                            seat: device.data::<DataDeviceUserData>().unwrap().wl_seat.clone(),
                         }),
                     )
                     .unwrap();

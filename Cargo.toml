@@ -79,6 +79,8 @@ glam = { version = "0.33.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 criterion = { version = "0.5" }
 image = "0.25"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
