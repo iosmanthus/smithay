@@ -13,11 +13,17 @@ use super::primary_selection::PrimaryDeviceUserData;
 use super::private::selection_dispatch;
 use super::wlr_data_control::DataControlDeviceUserData;
 
+/// The kind of device that a selection is offered on.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum DataDeviceKind {
-    Core,
-    Primary,
+#[non_exhaustive]
+pub enum SelectionDeviceKind {
+    /// `wl_data_device`: the clipboard of the focused client.
+    DataDevice,
+    /// `zwp_primary_selection_device_v1`: the primary selection of the focused client.
+    PrimarySelection,
+    /// `zwlr_data_control_device_v1`: a data-control client, for example a clipboard manager.
     WlrDataControl,
+    /// `ext_data_control_device_v1`: a data-control client, for example a clipboard manager.
     ExtDataControl,
 }
 
@@ -42,12 +48,12 @@ impl SelectionDevice {
         selection_dispatch!(self; Self(device) => device.id())
     }
 
-    pub fn device_kind(&self) -> DataDeviceKind {
+    pub fn device_kind(&self) -> SelectionDeviceKind {
         match self {
-            Self::DataDevice(_) => DataDeviceKind::Core,
-            Self::Primary(_) => DataDeviceKind::Primary,
-            Self::WlrDataControl(_) => DataDeviceKind::WlrDataControl,
-            Self::ExtDataControl(_) => DataDeviceKind::ExtDataControl,
+            Self::DataDevice(_) => SelectionDeviceKind::DataDevice,
+            Self::Primary(_) => SelectionDeviceKind::PrimarySelection,
+            Self::WlrDataControl(_) => SelectionDeviceKind::WlrDataControl,
+            Self::ExtDataControl(_) => SelectionDeviceKind::ExtDataControl,
         }
     }
 

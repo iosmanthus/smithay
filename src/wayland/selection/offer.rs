@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -24,10 +25,11 @@ use zwp_primary_selection_offer_v1::Request as PrimaryRequest;
 
 use crate::input::Seat;
 
-use super::SelectionHandler;
-use super::device::{DataDeviceKind, SelectionDevice};
+use super::device::{SelectionDevice, SelectionDeviceKind};
 use super::private::selection_dispatch;
+use super::seat_data::SeatData;
 use super::source::{CompositorSelectionProvider, SelectionSourceProvider};
+use super::{SelectionHandler, SelectionRead, SelectionReadSource, SelectionSource, SelectionTarget};
 
 #[derive(Debug, Clone)]
 pub enum OfferReplySource<U: Clone + Send + Sync + 'static> {
@@ -45,14 +47,6 @@ impl<U: Clone + Send + Sync + 'static> OfferReplySource<U> {
             OfferReplySource::Compositor(source) => source.mime_types.clone(),
         }
     }
-
-    /// Check whether the source contains the given `mime_type`.
-    pub fn contains_mime_type(&self, mime_type: &String) -> bool {
-        match self {
-            OfferReplySource::Client(source) => source.contains_mime_type(mime_type),
-            OfferReplySource::Compositor(source) => source.mime_types.contains(mime_type),
-        }
-    }
 }
 
 /// Offer representing various selection offers.
@@ -65,11 +59,16 @@ pub(crate) enum SelectionOffer {
 }
 
 impl SelectionOffer {
+    /// An offer of the selection `data` of `target` with `mime_types`, made on `device` when the
+    /// selection had changed `generation` times. The caller sends the mime types.
     pub fn new<D>(
         dh: &DisplayHandle,
         device: &SelectionDevice,
         client_id: ClientId,
         data: OfferReplySource<D::SelectionUserData>,
+        mime_types: Vec<String>,
+        target: SelectionTarget,
+        generation: u64,
     ) -> Self
     where
         D: SelectionHandler + 'static,
@@ -82,14 +81,17 @@ impl SelectionOffer {
             device_kind,
             seat: device.seat(),
             source: data,
+            mime_types,
+            target,
+            generation,
         });
         let backend = dh.backend_handle();
 
         let interface = match device_kind {
-            DataDeviceKind::Core => WlDataOffer::interface(),
-            DataDeviceKind::Primary => PrimaryOffer::interface(),
-            DataDeviceKind::WlrDataControl => ZwlrDataControlOfferV1::interface(),
-            DataDeviceKind::ExtDataControl => ExtDataControlOfferV1::interface(),
+            SelectionDeviceKind::DataDevice => WlDataOffer::interface(),
+            SelectionDeviceKind::PrimarySelection => PrimaryOffer::interface(),
+            SelectionDeviceKind::WlrDataControl => ZwlrDataControlOfferV1::interface(),
+            SelectionDeviceKind::ExtDataControl => ExtDataControlOfferV1::interface(),
         };
 
         let offer = backend
@@ -97,12 +99,12 @@ impl SelectionOffer {
             .unwrap();
 
         match device_kind {
-            DataDeviceKind::Core => Self::DataDevice(WlDataOffer::from_id(dh, offer).unwrap()),
-            DataDeviceKind::Primary => Self::Primary(PrimaryOffer::from_id(dh, offer).unwrap()),
-            DataDeviceKind::WlrDataControl => {
+            SelectionDeviceKind::DataDevice => Self::DataDevice(WlDataOffer::from_id(dh, offer).unwrap()),
+            SelectionDeviceKind::PrimarySelection => Self::Primary(PrimaryOffer::from_id(dh, offer).unwrap()),
+            SelectionDeviceKind::WlrDataControl => {
                 Self::WlrDataControl(ZwlrDataControlOfferV1::from_id(dh, offer).unwrap())
             }
-            DataDeviceKind::ExtDataControl => {
+            SelectionDeviceKind::ExtDataControl => {
                 Self::ExtDataControl(ExtDataControlOfferV1::from_id(dh, offer).unwrap())
             }
         }
@@ -114,9 +116,14 @@ impl SelectionOffer {
 }
 
 struct OfferReplyData<U: Clone + Send + Sync + 'static> {
-    device_kind: DataDeviceKind,
+    device_kind: SelectionDeviceKind,
     source: OfferReplySource<U>,
+    /// The mime types the offer announced; a source can add types later, which this offer did not
+    /// announce.
+    mime_types: Vec<String>,
     seat: WlSeat,
+    target: SelectionTarget,
+    generation: u64,
 }
 
 impl<D> ObjectData<D> for OfferReplyData<D::SelectionUserData>
@@ -135,59 +142,79 @@ where
         // NOTE: we can't parse message more than once, since it expects the `OwnedFd` which
         // we can't clone. To achieve that, we use RTTI passed along the selection data, to
         // make the parsing work only once.
-        let (mime_type, fd, object_name) = match self.device_kind {
-            DataDeviceKind::Core => {
-                if let Ok((_resource, DataOfferRequest::Receive { mime_type, fd })) =
+        let (reader, mime_type, fd, object_name) = match self.device_kind {
+            SelectionDeviceKind::DataDevice => {
+                if let Ok((resource, DataOfferRequest::Receive { mime_type, fd })) =
                     WlDataOffer::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "wl_data_offer")
+                    (resource.client(), mime_type, fd, "wl_data_offer")
                 } else {
                     return None;
                 }
             }
-            DataDeviceKind::Primary => {
-                if let Ok((_resource, PrimaryRequest::Receive { mime_type, fd })) =
+            SelectionDeviceKind::PrimarySelection => {
+                if let Ok((resource, PrimaryRequest::Receive { mime_type, fd })) =
                     PrimaryOffer::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "primary_selection_offer")
+                    (resource.client(), mime_type, fd, "primary_selection_offer")
                 } else {
                     return None;
                 }
             }
-            DataDeviceKind::WlrDataControl => {
-                if let Ok((_resource, DataControlRequest::Receive { mime_type, fd })) =
+            SelectionDeviceKind::WlrDataControl => {
+                if let Ok((resource, DataControlRequest::Receive { mime_type, fd })) =
                     ZwlrDataControlOfferV1::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "wlr_data_control_offer")
+                    (resource.client(), mime_type, fd, "wlr_data_control_offer")
                 } else {
                     return None;
                 }
             }
-            DataDeviceKind::ExtDataControl => {
-                if let Ok((_resource, ext_data_control_offer_v1::Request::Receive { mime_type, fd })) =
+            SelectionDeviceKind::ExtDataControl => {
+                if let Ok((resource, ext_data_control_offer_v1::Request::Receive { mime_type, fd })) =
                     ExtDataControlOfferV1::parse_request(&dh, msg)
                 {
-                    (mime_type, fd, "ext_data_control_offer")
+                    (resource.client(), mime_type, fd, "ext_data_control_offer")
                 } else {
                     return None;
                 }
             }
         };
 
-        if !self.source.contains_mime_type(&mime_type) {
-            debug!("Denying a {object_name}.receive with invalid mime type");
-        } else {
-            match &self.source {
-                OfferReplySource::Client(source) => {
-                    source.send(mime_type, fd);
-                }
-                OfferReplySource::Compositor(source) => {
-                    if let Some(seat) = Seat::<D>::from_resource(&self.seat) {
-                        handle.send_selection(source.ty, mime_type, fd, seat, &source.user_data);
-                    }
-                }
-            }
+        if !self.mime_types.contains(&mime_type) {
+            debug!("Denying a {object_name}.receive with a mime type that was not offered");
+            return None;
         }
+
+        // Every read goes through the handler, which may control access: without a seat or a
+        // reader there is nobody to ask, and the read is refused.
+        let (Some(reader), Some(seat)) = (reader, Seat::<D>::from_resource(&self.seat)) else {
+            debug!("Denying a {object_name}.receive without a seat");
+            return None;
+        };
+        let current = seat
+            .user_data()
+            .get::<RefCell<SeatData<D::SelectionUserData>>>()
+            .is_some_and(|data| data.borrow().generation(self.target) == self.generation);
+        let source = match &self.source {
+            OfferReplySource::Client(provider) => SelectionReadSource::Client(SelectionSource {
+                provider: provider.clone(),
+            }),
+            OfferReplySource::Compositor(source) => {
+                debug_assert_eq!(source.ty, self.target);
+                SelectionReadSource::Compositor(source.user_data.clone())
+            }
+        };
+        let read = SelectionRead {
+            target: self.target,
+            device_kind: self.device_kind,
+            reader,
+            source,
+            mime_type,
+            generation: self.generation,
+            current,
+        };
+        handle.receive_selection(read, fd, seat);
 
         None
     }

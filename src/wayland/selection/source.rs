@@ -3,7 +3,7 @@ use std::os::unix::io::{AsFd, OwnedFd};
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1 as PrimarySource;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1;
-use wayland_server::{Resource, protocol::wl_data_source::WlDataSource};
+use wayland_server::{Client, Resource, protocol::wl_data_source::WlDataSource};
 
 use crate::wayland::selection::primary_selection::PrimarySourceUserData;
 
@@ -24,6 +24,16 @@ impl SelectionSource {
     /// Mime types associated with the source.
     pub fn mime_types(&self) -> Vec<String> {
         self.provider.mime_types()
+    }
+
+    /// The client that owns the source, while it is connected.
+    pub fn client(&self) -> Option<Client> {
+        self.provider.client()
+    }
+
+    /// Ask the source's client to write the data of `mime_type` into `fd`.
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        self.provider.send(mime_type, fd)
     }
 }
 
@@ -49,6 +59,11 @@ impl SelectionSourceProvider {
     /// Send the data with the specified `mime_type` using the given `fd`.
     pub fn send(&self, mime_type: String, fd: OwnedFd) {
         selection_dispatch!(self; Self(source) => source.send(mime_type, fd.as_fd()))
+    }
+
+    /// The client that owns the source, while it is connected.
+    pub fn client(&self) -> Option<Client> {
+        selection_dispatch!(self; Self(source) => source.client())
     }
 
     /// Check whether the given selection source contains provided `mime_type`.
